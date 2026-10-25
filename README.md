@@ -10,7 +10,7 @@ Codex LAN Companion is a small self-hosted web service for viewing and lightly c
 
 This is an unofficial tool. It reads local Codex Desktop state and, by default, can use local Codex Desktop IPC or the bundled CLI App Server to send messages from the LAN web UI. Start with `--readonly` if you only want to view conversations.
 
-Model and reasoning effort selectors occupy their own bottom row; attachment and send buttons share the row above with the account, plugins, skills and refresh controls.
+The account/plan usage button (such as Pro / Lite) shares the bottom row with model and reasoning effort selectors. Files, plugins, skills and refresh share the row above with attachment and send controls.
 
 On phones, Enter inserts a line break; tap the send button to send a message. This applies to narrow screens (up to 760px) and devices with a coarse primary pointer, including phones in landscape. On desktop, Enter sends and Shift+Enter inserts a line break.
 
@@ -34,7 +34,7 @@ This fork is maintained at [luyunyu/codex-lan-companion](https://github.com/luyu
 | Models and quota | Choose model and reasoning effort for the next message; recover actual conversation effort when available; lock input during execution; show remaining plan quota. |
 | New conversation compatibility | Fall back to the local App Server when legacy Desktop creation IPC is unavailable, validate directory and project membership, execute in the background and notify Desktop without switching conversations. |
 
-Validation for this update: syntax checks and 104 automated tests pass; 2 opt-in CLI integration tests are skipped by default. Earlier development sessions exercised browser layouts, new-conversation creation and skill injection on this machine. This is not a guarantee of compatibility with every Desktop build; private IPC and storage formats can change. See [CHANGELOG.md](CHANGELOG.md) for details and the sections below for behavior and limitations.
+Validation for this update: syntax checks and 109 automated tests pass; 2 opt-in CLI integration tests are skipped by default. Earlier development sessions exercised browser layouts, new-conversation creation and skill injection on this machine. This is not a guarantee of compatibility with every Desktop build; private IPC and storage formats can change. See [CHANGELOG.md](CHANGELOG.md) for details and the sections below for behavior and limitations.
 
 To run this fork from source:
 
@@ -208,6 +208,12 @@ codex-lan-companion --readonly
 ```
 
 By default, the web UI can send text, selected plugin or skill mentions, and supported image attachments to Codex through local Desktop IPC or the background App Server connection. Codex Desktop should be open and signed in on the Mac running this service. `--readonly` disables sending, interruption, and approval actions from the browser.
+
+After updating source files, restart Companion before refreshing the page. Refreshing alone loads new frontend files while the running Node.js process still serves its old API. A plain-text 404 from the file browser API now shows a restart hint.
+
+Click **Files** in the composer to browse the current project's root directory. Clicking a folder adds a column to the right while retaining its ancestors; switch folders directly or use the path at the top to return to an ancestor. Columns scroll horizontally on narrow screens. Selecting a file inserts its full path as plain text at the saved caret, replacing selected text and supporting undo. This references a path; it does not read or automatically attach the file contents or create a skill input item. Codex can read the referenced path during execution.
+
+The picker reads one directory at a time without building a global search index. Each directory scan is capped at 2000 entries, with a notice when truncated. Multi-root projects offer a root selector; worktree conversations use their actual working directory. Drafts use the selected project root, or the server's launch directory when no project is selected. The authenticated `GET /api/project-files` endpoint returns directory entries within the current account's known project/conversation roots and checks path and symlink boundaries. Account or conversation changes close the picker and discard late responses. File insertion is disabled in read-only mode and while a task is running.
 
 The skill picker reads Codex App Server's `skills/list` catalog for the selected conversation's working directory, showing only enabled skills. Codex determines which project, global and plugin skills are available. Cached `SKILL.md` files alone do not make a skill available: old `artifact-template-*` files and disabled skills are excluded. If the native catalog cannot be loaded, discovery reports an error instead of scanning the plugin cache. A send-time check rejects stale skill references before any message or new conversation is submitted.
 

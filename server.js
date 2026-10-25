@@ -16,6 +16,7 @@ import { AppServerThreadClient } from "./lib/app-server-thread.js";
 import { readModelCatalog, readRolloutModelSettings, mergeModelSettings, validateModelSettings } from "./lib/model-settings.js";
 import { findSkillFiles, projectSkillRoots } from "./lib/skill-discovery.js";
 import { projectCatalog, withThreadProjects, threadPage } from "./lib/thread-projects.js";
+import { fileBrowserRoots, listProjectDirectory } from "./lib/project-files.js";
 import { ThreadStatusReader } from "./lib/thread-status.js";
 import { stripInjectedUserContext } from "./lib/user-message-content.js";
 import { readRolloutWindow } from "./lib/rollout-history.js";
@@ -1809,6 +1810,36 @@ async function resolveNewThreadProject(projectId) {
     }
   }
   return { ...project, codexHome: context.home };
+}
+
+async function getProjectFiles(params) {
+  const homeState = await refreshCodexHomeContext({ source: "files" });
+  const threadId = params.get("threadId");
+  const projectId = params.get("projectId");
+  let roots;
+  if (threadId) {
+    const row = (await getThreads()).find((thread) => thread.id === threadId);
+    if (!row) throw Object.assign(new Error("Thread is not available in the current account"), { status: 404 });
+    const context = await getProjectContext();
+    const [thread] = withThreadProjects([row], context, context.memberships);
+    roots = fileBrowserRoots(thread, context.projects);
+  } else {
+    roots = projectId ? (await resolveNewThreadProject(projectId)).rootPaths : [process.cwd()];
+  }
+  if (!roots.length) throw Object.assign(new Error("No local project directory is available"), { status: 404 });
+  let result;
+  try {
+    result = await listProjectDirectory(roots, { root: params.get("root") || "0", directory: params.get("directory") || "" });
+  } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes(error.code)) throw Object.assign(new Error("Project directory is unavailable"), { status: 404 });
+    if (["EACCES", "EPERM"].includes(error.code)) throw Object.assign(new Error("Project directory cannot be read"), { status: 403 });
+    throw error;
+  }
+  if ((await refreshCodexHomeContext()).version !== homeState.version
+    || (params.has("homeVersion") && params.get("homeVersion") !== String(homeState.version))) {
+    throw Object.assign(new Error("Codex home changed; refresh the project list"), { status: 409 });
+  }
+  return result;
 }
 
 async function addThreadStatuses(page) {
@@ -3901,6 +3932,11 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/api/plugins") {
       if (!requireAuthorized(req, res, url)) return;
       sendJson(res, 200, await getPlugins());
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/api/project-files") {
+      if (!requireAuthorized(req, res, url)) return;
+      sendJson(res, 200, await getProjectFiles(url.searchParams));
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/skills") {

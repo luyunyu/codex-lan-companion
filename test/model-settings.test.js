@@ -43,10 +43,11 @@ test("running conversations disable editing and all insert controls, retain stop
   const render = vm.runInNewContext(`${composer}\nrenderComposerMode`, {
     state, els, DRAFT_THREAD_ID: "draft", syncSkillContext: () => false, isSubagentView: () => false,
     hasComposerPayload: () => true, renderModelControls: (disabled) => { modelDisabled = disabled; },
+    filePicker: { sync: (disabled) => { els.filePickerButton = { disabled }; } },
     closePluginMentionMenu() {}, closeSkillMentionMenu() {}, closeImagePickerMenu() {}, autoResizeComposerInput() {}, t: (key) => key
   });
   render();
-  for (const name of ["composerInput", "attachButton", "pluginPickerButton", "skillPickerButton"]) assert.equal(els[name].disabled, true);
+  for (const name of ["composerInput", "attachButton", "pluginPickerButton", "skillPickerButton", "filePickerButton"]) assert.equal(els[name].disabled, true);
   assert.equal(modelDisabled, true);
   assert.equal(els.sendButton.disabled, false);
   state.composerBusy = true;
@@ -56,6 +57,7 @@ test("running conversations disable editing and all insert controls, retain stop
   state.threadStatus.thinking = false;
   render();
   assert.equal(els.composerInput.disabled, false);
+  assert.equal(els.filePickerButton.disabled, false);
   assert.equal(modelDisabled, false);
   state.config.allowWrite = false;
   render();

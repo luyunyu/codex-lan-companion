@@ -4,9 +4,13 @@
 
 Based on upstream `de6ada9`. This fork update covers project-aware navigation, message history and rendering, subagent views, native skill/plugin input, composer drafts, model controls and App Server creation compatibility. Package version remains `0.1.0`; no npm release is made.
 
-Validation: syntax checks pass; 104 automated tests pass and 2 opt-in CLI integration tests are skipped. Browser and live creation/skill checks were performed during development on the local machine; compatibility with other Desktop builds is not guaranteed.
+Validation: syntax checks pass; 109 automated tests pass and 2 opt-in CLI integration tests are skipped. Browser and live creation/skill checks were performed during development on the local machine; compatibility with other Desktop builds is not guaranteed.
+
+- Handle non-JSON API errors without exposing JSON parser failures; show a restart hint when a stale running server lacks the file browser endpoint, retaining authentication error handling.
 
 - Use Enter for line breaks on mobile, including landscape, and require the send button to submit messages; preserve desktop Enter-to-send behavior.
+
+- Add an on-demand, Finder-style column file picker with directory breadcrumbs, multi-root selection, worktree handling and caret insertion of plain file paths. Bound directory reads, enforce authentication and root/symlink boundaries, and ignore stale responses. Move account/plan usage beside the model controls. Validate desktop and 375px layouts, path insertion and undo using a simulated conversation.
 
 - Recover conversation reasoning effort from recent turn metadata when Desktop omits it, expand bounded lookback for long turns, and refresh the displayed effort without inventing a model default.
 

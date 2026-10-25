@@ -120,16 +120,9 @@
           <div class="composer-actions">
             <div class="composer-left">
               <div class="account-widget">
-                <button
-                  id="accountSummary"
-                  class="account-summary"
-                  type="button"
-                  title="显示套餐用量"
-                  aria-label="显示套餐用量"
-                  aria-expanded="false"
-                >
-                  <span id="accountName" class="account-name">Codex</span>
-                  <span id="accountPlan" class="account-plan">-</span>
+                <button id="filePickerButton" class="plugin-picker-button" type="button" title="引用文件" aria-label="引用文件" aria-expanded="false" aria-controls="filePickerPanel">
+                  <svg class="file-picker-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V5h7l2 2h9v13H3Z"></path></svg>
+                  <span class="plugin-picker-label">文件</span>
                 </button>
                 <button
                   id="pluginPickerButton"
@@ -181,7 +174,19 @@
               </button>
             </div>
           </div>
+          <div id="filePickerPanel" class="file-picker-panel" role="dialog" aria-label="引用文件" hidden></div>
           <div class="composer-model-controls">
+            <button
+              id="accountSummary"
+              class="account-summary"
+              type="button"
+              title="显示套餐用量"
+              aria-label="显示套餐用量"
+              aria-expanded="false"
+            >
+              <span id="accountName" class="account-name">Codex</span>
+              <span id="accountPlan" class="account-plan">-</span>
+            </button>
             <button id="modelRetry" class="model-retry" type="button" hidden></button>
             <label><span id="modelLabel">模型</span><select id="modelSelect" disabled></select></label>
             <label><span id="effortLabel">推理强度</span><select id="effortSelect" disabled></select></label>

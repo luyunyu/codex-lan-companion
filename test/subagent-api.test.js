@@ -52,6 +52,7 @@ test("authenticated API hides indexed/spawned children and returns live and arch
   }
   assert.equal(ready, true, output);
   assert.equal((await fetch(`${base}/api/threads`)).status, 401);
+  assert.equal((await fetch(`${base}/api/project-files`)).status, 401);
   const get = async (url) => {
     const response = await fetch(`${base}${url}`, { headers: { Authorization: "Bearer fixture-code" } });
     const data = await response.json();
@@ -59,6 +60,15 @@ test("authenticated API hides indexed/spawned children and returns live and arch
     return data;
   };
   const list = await get(`/api/threads?selectedId=${ids[2]}`);
+  const files = await get(`/api/project-files?threadId=${ids[0]}&homeVersion=${list.codexHomeVersion}`);
+  assert.equal(files.absolutePath, home);
+  assert.ok(files.entries.some((entry) => entry.name === "sessions" && entry.directory));
+  const filesStatus = async (query) => (await fetch(`${base}/api/project-files?${query}`, {
+    headers: { Authorization: "Bearer fixture-code" }
+  })).status;
+  assert.equal(await filesStatus("threadId=unknown"), 404);
+  assert.equal(await filesStatus(`threadId=${ids[0]}&directory=..`), 403);
+  assert.equal(await filesStatus(`threadId=${ids[0]}&homeVersion=stale`), 409);
   assert.deepEqual(list.threads.map((row) => row.id).sort(), [ids[0], ids[4]]);
   assert.equal(list.total, 2);
   assert.equal(list.selectedThread.id, ids[2]);

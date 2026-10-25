@@ -2,6 +2,7 @@ import { renderMarkdown, isVisibleMessage, assistantMessageStyle } from "./messa
 import { mergeMessageHistory } from "./message-history.js";
 import { installInlineComposer } from "./inline-composer.js";
 import { composerMarkdown } from "./mention-format.js";
+import { installFilePicker } from "./file-picker.js";
 
 const state = {
   threads: [],
@@ -124,6 +125,8 @@ const els = {
   accountPlan: document.querySelector("#accountPlan"),
   pluginPickerButton: document.querySelector("#pluginPickerButton"),
   skillPickerButton: document.querySelector("#skillPickerButton"),
+  filePickerButton: document.querySelector("#filePickerButton"),
+  filePickerPanel: document.querySelector("#filePickerPanel"),
   accountPanel: document.querySelector("#accountPanel"),
   authGate: document.querySelector("#authGate"),
   authForm: document.querySelector("#authForm"),
@@ -256,6 +259,18 @@ const I18N = {
     pluginPickerTitle: "引用插件",
     pluginPickerLoading: "正在加载插件...",
     pluginPickerEmpty: "没有找到匹配插件",
+    filePickerTitle: "引用文件",
+    filePickerLabel: "文件",
+    fileClose: "关闭文件选择器",
+    fileRoot: "项目根目录",
+    fileCurrentDirectory: "当前目录",
+    fileLoading: "正在读取目录…",
+    fileEmpty: "此目录为空",
+    fileFailed: "无法读取目录：{message}",
+    fileRetry: "重试",
+    fileApiUnavailable: "当前服务尚未提供文件目录接口，请重启 Companion 服务并刷新页面。",
+    apiInvalidResponse: "服务返回了非 JSON 响应（HTTP {status}），请确认服务版本并重启。",
+    fileTruncated: "此目录仅显示前 2000 个条目",
     skillPickerTitle: "引用技能",
     skillProjectSource: "项目",
     skillPickerLoading: "正在加载技能...",
@@ -383,6 +398,18 @@ const I18N = {
     pluginPickerTitle: "Mention plugin",
     pluginPickerLoading: "Loading plugins...",
     pluginPickerEmpty: "No matching plugins",
+    filePickerTitle: "Reference file",
+    filePickerLabel: "Files",
+    fileClose: "Close file picker",
+    fileRoot: "Project root",
+    fileCurrentDirectory: "Current directory",
+    fileLoading: "Loading directory…",
+    fileEmpty: "This directory is empty",
+    fileFailed: "Could not read directory: {message}",
+    fileRetry: "Retry",
+    fileApiUnavailable: "The running server does not provide the file browser API. Restart Companion and refresh the page.",
+    apiInvalidResponse: "The server returned a non-JSON response (HTTP {status}). Check the server version and restart it.",
+    fileTruncated: "Only the first 2000 entries are shown",
     skillPickerTitle: "Mention skill",
     skillProjectSource: "Project",
     skillPickerLoading: "Loading skills...",
@@ -420,6 +447,23 @@ function clearDraftThread() {
   state.draftThread = null;
   state.draftStartedAt = 0;
 }
+
+const filePicker = installFilePicker({
+  button: els.filePickerButton, panel: els.filePickerPanel, input: els.composerInput,
+  t,
+  fetchJson: async (url) => {
+    try { return await fetchJson(url); }
+    catch (error) { handleUnauthorized(error); throw error; }
+  },
+  getContext: () => {
+    const thread = state.selectedId === DRAFT_THREAD_ID ? state.draftThread
+      : state.lastMessagesData?.thread?.id === state.selectedId ? state.lastMessagesData.thread
+      : state.threads.find((item) => item.id === state.selectedId) || state.selectedThread;
+    return { threadId: state.selectedId === DRAFT_THREAD_ID ? "" : state.selectedId,
+      projectId: thread?.projectId || "", cwd: thread?.cwd || "", homeVersion: state.codexHomeVersion };
+  },
+  onOpen: () => { closePluginMentionMenu(); closeSkillMentionMenu(); closeImagePickerMenu(); closeAccountPanel(); }
+});
 
 function selectComposerThread(threadId, { moveDraft = false } = {}) {
   const previousId = state.selectedId;
@@ -479,6 +523,8 @@ function applyStaticText() {
   els.accountSummary.setAttribute("aria-label", t("showUsage"));
   els.pluginPickerButton.setAttribute("title", t("pluginPickerTitle"));
   els.pluginPickerButton.setAttribute("aria-label", t("pluginPickerTitle"));
+  filePicker.sync();
+  els.filePickerPanel.setAttribute("aria-label", t("filePickerTitle"));
   els.skillPickerButton.setAttribute("title", t("skillPickerTitle"));
   els.skillPickerButton.setAttribute("aria-label", t("skillPickerTitle"));
   els.attachButton.setAttribute("title", t("addImage"));
@@ -562,6 +608,7 @@ function lockApp(message = "") {
   safeStorageRemove(sessionStorage, "codexLanToken");
   safeStorageRemove(localStorage, "codexLanToken");
   state.authToken = "";
+  filePicker.close();
   state.authLocked = true;
   state.threadNavigation = [];
   state.subagents = [];
@@ -1301,7 +1348,16 @@ async function loadAccount() {
 
 async function fetchJson(url) {
   const response = await fetch(url, { cache: "no-store", headers: authHeaders() });
-  const data = await response.json();
+  let data;
+  try {
+    data = JSON.parse(await response.text());
+  } catch {
+    const error = new Error(response.status === 404 && url.startsWith("/api/project-files?")
+      ? t("fileApiUnavailable") : t("apiInvalidResponse", { status: response.status }));
+    error.status = response.status;
+    handleUnauthorized(error);
+    throw error;
+  }
   if (!response.ok) {
     const error = new Error(data.error || response.statusText);
     error.status = response.status;
@@ -1807,6 +1863,7 @@ function renderComposerMode() {
   els.attachButton.disabled = inputDisabled;
   els.pluginPickerButton.disabled = inputDisabled;
   els.skillPickerButton.disabled = inputDisabled;
+  filePicker.sync(inputDisabled);
   els.sendButton.disabled = !canSend;
   els.sendButton.classList.toggle("stop-mode", allowWrite && thinking);
   els.sendButton.setAttribute("aria-label", allowWrite && thinking ? t("stopCurrentTask") : t("send"));
@@ -1836,6 +1893,7 @@ function applyHomeContext(data) {
   state.codexHome = data.codexHome || state.codexHome;
   state.codexHomeVersion = Number.isFinite(version) ? version : state.codexHomeVersion;
   if (!changed) return false;
+  filePicker.close();
   state.composerDrafts.clear();
   state.modelSelections?.clear();
   state.modelContext = "";

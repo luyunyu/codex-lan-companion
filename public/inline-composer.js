@@ -131,6 +131,13 @@ export function installInlineComposer(input) {
     if (!/^\s/.test(after)) nodes.push(document.createTextNode(" "));
     replace(start, end, nodes);
   };
+  input.insertText = (value, start = selection()[0], end = selection()[1]) => {
+    const before = text().slice(0, start);
+    const after = text().slice(end);
+    const prefix = before && !/\s$/.test(before) ? " " : "";
+    const suffix = /^\s/.test(after) ? "" : " ";
+    replace(start, end, [document.createTextNode(prefix + value + suffix)]);
+  };
   Object.defineProperties(input, {
     value: {
       get: text,

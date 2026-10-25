@@ -22,7 +22,7 @@ function fixture() {
     closePluginMentionMenu() {}, closeImagePickerMenu() {}, renderSkillMentionMenu() {}, renderModelControls() {},
     applyHomeContext: () => false, lockApp() {}, t: (key) => key,
     hasComposerPayload: () => Boolean(state.selectedSkills.length), autoResizeComposerInput() {},
-    isSubagentView: () => false,
+    isSubagentView: () => false, filePicker: { sync() {} },
     fetchJson: (url) => new Promise((resolve, reject) => pending.push({ url, resolve, reject }))
   };
   const api = vm.runInNewContext(`${loading}\n${composer}\n({ loadSkills, syncSkillContext, renderComposerMode })`, context);

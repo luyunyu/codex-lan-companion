@@ -12,7 +12,7 @@ function fixture() {
   const els = { composerInput: { value: "" }, messageList: {} };
   const noop = () => {};
   const context = {
-    state, els, closePluginMentionMenu: noop, closeSkillMentionMenu: noop,
+    state, els, filePicker: { close: noop }, closePluginMentionMenu: noop, closeSkillMentionMenu: noop,
     autoResizeComposerInput: noop, clearDraftThread: noop, renderSubagents: noop,
     initProjectPreference: noop, hasActiveDraft: () => false,
     clearSelectedPlugins: noop, clearSelectedSkills: noop, t: (key) => key, escapeHtml: (value) => value
