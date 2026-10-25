@@ -6,6 +6,8 @@ Based on upstream `de6ada9`. This fork update covers project-aware navigation, m
 
 Validation: syntax checks pass; 104 automated tests pass and 2 opt-in CLI integration tests are skipped. Browser and live creation/skill checks were performed during development on the local machine; compatibility with other Desktop builds is not guaranteed.
 
+- Use Enter for line breaks on mobile, including landscape, and require the send button to submit messages; preserve desktop Enter-to-send behavior.
+
 - Recover conversation reasoning effort from recent turn metadata when Desktop omits it, expand bounded lookback for long turns, and refresh the displayed effort without inventing a model default.
 
 - Show remaining plan quota percentages instead of consumed usage, preserving unknown values as unavailable.

@@ -2522,6 +2522,8 @@ els.authForm.addEventListener("submit", async (event) => {
 
 els.composerInput.addEventListener("keydown", (event) => {
   if (event.isComposing || event.keyCode === 229) return;
+  // Keep Enter available for line breaks on phones, including landscape mode.
+  if (event.key === "Enter" && window.matchMedia("(max-width: 760px), (pointer: coarse)").matches) return;
   if (state.pluginMenuOpen) {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
