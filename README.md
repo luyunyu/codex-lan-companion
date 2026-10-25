@@ -10,6 +10,8 @@ Codex LAN Companion is a small self-hosted web service for viewing and lightly c
 
 This is an unofficial tool. It reads local Codex Desktop state and, by default, can use local Codex Desktop IPC or the bundled CLI App Server to send messages from the LAN web UI. Start with `--readonly` if you only want to view conversations.
 
+Model and reasoning effort selectors occupy their own bottom row; attachment and send buttons share the row above with the account, plugins, skills and refresh controls.
+
 The composer locks message input, attachments, plugin/skill insertion, and model controls while the selected conversation is running; the stop button remains available. The model and reasoning effort selectors use the local Codex catalog and apply your choices with the next message, including the first message of a new conversation. Leave them on “Use current” to inherit the conversation settings. Available efforts depend on the model. Permission settings remain managed by Codex Desktop. If the catalog cannot be loaded, retry from the composer; sending with inherited settings still works.
 
 Plan quota percentages show the remaining allowance (100% minus usage) for both windows; missing records display “-”.
