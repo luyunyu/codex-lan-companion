@@ -107,4 +107,3 @@ test("the browser leaves draft mode after a partial failure, preserving the sele
   assert.equal(recover({ threadId: "another-thread" }), false);
   assert.equal(state.selectedId, "created-thread");
 });
-
