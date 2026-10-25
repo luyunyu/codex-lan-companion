@@ -1,10 +1,26 @@
+import { renderMarkdown, isVisibleMessage, assistantMessageStyle } from "./message-format.js";
+import { mergeMessageHistory } from "./message-history.js";
+import { installInlineComposer } from "./inline-composer.js";
+import { composerMarkdown } from "./mention-format.js";
+
 const state = {
   threads: [],
+  projects: [],
+  selectedThread: null,
+  threadNavigation: [],
+  subagents: [],
+  subagentMenuOpen: false,
+  projectFilter: "",
+  threadTotal: 0,
+  threadNextOffset: 0,
+  threadHasMore: false,
+  threadLoading: false,
+  threadRequestSeq: 0,
   selectedId: null,
   draftThread: null,
+  composerDrafts: new Map(),
   messagesSignature: "",
   filter: "",
-  showTools: false,
   expandedNotices: {},
   sidebarCollapsed: false,
   messageRequestSeq: 0,
@@ -18,11 +34,20 @@ const state = {
   authToken: "",
   authLocked: false,
   threadStatus: null,
+  modelContext: "",
+  modelsRequest: null,
+  modelsLoadedAt: 0,
+  modelsLoading: false,
+  modelsError: false,
+  modelCatalog: [],
+  currentModelSettings: {},
+  modelSelections: new Map(),
   composerBusy: false,
   imageAttachments: [],
   pendingMessages: [],
   approvalSubmissions: {},
   lastMessagesData: null,
+  messageHistory: null,
   plugins: [],
   pluginsLoaded: false,
   pluginsLoading: false,
@@ -30,22 +55,24 @@ const state = {
   pluginQuery: "",
   pluginTriggerStart: -1,
   pluginActiveIndex: 0,
-  selectedPlugins: [],
   skills: [],
   skillsLoaded: false,
+  skillsContext: "",
+  skillsRequest: null,
   skillsLoading: false,
+  skillsError: "",
   skillMenuOpen: false,
   skillQuery: "",
   skillTriggerStart: -1,
   skillActiveIndex: 0,
-  selectedSkills: [],
   threadSyncBackoffMs: 0,
   messageSyncBackoffMs: 0,
   accountSyncBackoffMs: 0,
   lastSyncActivityAt: Date.now()
 };
 
-const MESSAGE_SYNC_LIMIT = 80;
+const PROJECT_FILTER_STORAGE_KEY = "codexLanProjectFilter";
+const MESSAGE_SYNC_LIMIT = 40;
 const THREAD_SYNC_INTERVAL_MS = 12000;
 const MESSAGE_SYNC_THINKING_MS = 2000;
 const MESSAGE_SYNC_IDLE_MS = 6000;
@@ -60,22 +87,28 @@ const els = {
   shell: document.querySelector("#shell"),
   threadCount: document.querySelector("#threadCount"),
   threadList: document.querySelector("#threadList"),
+  projectFilter: document.querySelector("#projectFilter"),
+  draftProjectField: document.querySelector("#draftProjectField"),
+  draftProjectSelect: document.querySelector("#draftProjectSelect"),
   threadTitle: document.querySelector("#threadTitle"),
   threadMeta: document.querySelector("#threadMeta"),
   messageList: document.querySelector("#messageList"),
   scrollToBottomButton: document.querySelector("#scrollToBottomButton"),
   refreshButton: document.querySelector("#refreshButton"),
+  parentThreadButton: document.querySelector("#parentThreadButton"),
+  subagentButton: document.querySelector("#subagentButton"),
+  subagentCounts: document.querySelector("#subagentCounts"),
+  subagentMenu: document.querySelector("#subagentMenu"),
   sidebarToggle: document.querySelector("#sidebarToggle"),
   drawerOverlay: document.querySelector("#drawerOverlay"),
   sidebarCloseButton: document.querySelector("#sidebarCloseButton"),
   searchInput: document.querySelector("#searchInput"),
   newThreadButton: document.querySelector("#newThreadButton"),
-  toolToggle: document.querySelector("#toolToggle"),
+  modelSelect: document.querySelector("#modelSelect"),
+  effortSelect: document.querySelector("#effortSelect"),
   composerForm: document.querySelector("#composerForm"),
   composerInput: document.querySelector("#composerInput"),
-  pluginMentionTray: document.querySelector("#pluginMentionTray"),
   pluginMentionMenu: document.querySelector("#pluginMentionMenu"),
-  skillMentionTray: document.querySelector("#skillMentionTray"),
   skillMentionMenu: document.querySelector("#skillMentionMenu"),
   imageInput: document.querySelector("#imageInput"),
   imageFileInput: document.querySelector("#imageFileInput"),
@@ -101,6 +134,8 @@ const els = {
   authError: document.querySelector("#authError")
 };
 
+installInlineComposer(els.composerInput);
+
 const I18N = {
   zh: {
     documentTitle: "Codex LAN Viewer",
@@ -116,6 +151,16 @@ const I18N = {
     closeThreads: "关闭对话列表",
     hideThreads: "隐藏对话列表",
     refresh: "刷新",
+    backToParent: "返回父会话",
+    subagentCounts: "{running} 进行中 {completed} 已完成",
+    subagentRunningCount: "{count} 进行中",
+    subagentCompletedCount: "{count} 已完成",
+    subagentRunning: "进行中",
+    subagentCompleted: "已完成",
+    subagentIdle: "未运行",
+    subagentUnknown: "状态未知",
+    subagentReadonly: "子 agent 会话仅供查看",
+    viewSubagents: "查看子 agent 会话",
     loading: "加载中",
     searchThreads: "搜索对话",
     newConversation: "新对话",
@@ -123,6 +168,14 @@ const I18N = {
     newConversationReady: "输入消息开始新对话。",
     newConversationFailed: "新建对话失败：{message}",
     threadList: "对话列表",
+    allProjects: "所有项目",
+    unavailableProject: "所选项目暂不可用",
+    noProject: "未归属项目",
+    project: "所属项目",
+    defaultDirectory: "默认目录（服务启动目录）",
+    loadMoreThreads: "加载更多对话",
+    noThreads: "没有匹配的对话",
+    loadedThreads: "已加载 {count} / {total} 个对话",
     selectThread: "选择一个对话",
     syncEvery: "每 3 秒自动同步",
     pickThread: "从左侧选择一个 Codex 对话。",
@@ -153,6 +206,11 @@ const I18N = {
     imageUnsupported: "不支持此图片格式，请换 JPEG、PNG、WebP、GIF、HEIC 或 BMP。",
     imageDimensionsInvalid: "图片尺寸不支持，宽高需在 {min}-{max}px 之间。",
     tooManyImages: "最多只能添加 {count} 张图片。",
+    modelLabel: "模型",
+    effortLabel: "推理强度",
+    inheritSetting: "沿用当前",
+    defaultEffort: "模型默认",
+    modelLoadFailed: "模型读取失败，点击重试",
     sendToCodex: "发送到当前 Codex 窗口",
     readonlyPlaceholder: "只读模式：重启时不要加 --readonly 才能发送",
     readonly: "只读模式",
@@ -162,13 +220,22 @@ const I18N = {
     syncFailed: "同步失败",
     syncTemporaryFailed: "同步暂时失败",
     emptyThread: "这个对话暂时没有可展示内容。",
-    contents: "{count} 条内容",
+    contents: "已加载 {count} 条消息",
     thinking: "思考中...",
+    threadRunning: "运行中",
     processing: "正在处理",
     sent: "已发送",
+    reasoningLabel: "思考过程",
+    progressLabel: "执行进展",
+    answerLabel: "回答",
+    finalAnswerLabel: "最终回答",
+    loadOlderMessages: "加载更早的消息",
+    loadingOlderMessages: "正在加载历史消息…",
+    historyLoadFailed: "加载失败，点击重试",
+    historyStart: "已到会话开头",
     processed: "已处理",
-    primaryUsage: "主要用量",
-    longTermUsage: "长期用量",
+    primaryUsage: "剩余额度",
+    longTermUsage: "长期剩余额度",
     credit: "额度",
     unlimitedCredit: "额度无限",
     balance: "余额 {balance}",
@@ -190,7 +257,9 @@ const I18N = {
     pluginPickerLoading: "正在加载插件...",
     pluginPickerEmpty: "没有找到匹配插件",
     skillPickerTitle: "引用技能",
+    skillProjectSource: "项目",
     skillPickerLoading: "正在加载技能...",
+    skillPickerFailed: "技能列表加载失败：{message}",
     skillPickerEmpty: "没有找到匹配技能",
     untitled: "Untitled",
     separator: " · "
@@ -209,6 +278,16 @@ const I18N = {
     closeThreads: "Close conversations",
     hideThreads: "Hide conversations",
     refresh: "Refresh",
+    backToParent: "Back to parent conversation",
+    subagentCounts: "{running} running {completed} completed",
+    subagentRunningCount: "{count} running",
+    subagentCompletedCount: "{count} completed",
+    subagentRunning: "Running",
+    subagentCompleted: "Completed",
+    subagentIdle: "Idle",
+    subagentUnknown: "Status unknown",
+    subagentReadonly: "Subagent conversations are view-only",
+    viewSubagents: "View subagent conversations",
     loading: "Loading",
     searchThreads: "Search conversations",
     newConversation: "New chat",
@@ -216,6 +295,14 @@ const I18N = {
     newConversationReady: "Type a message to start a new chat.",
     newConversationFailed: "Could not start a new chat: {message}",
     threadList: "Conversation list",
+    allProjects: "All projects",
+    unavailableProject: "Selected project unavailable",
+    noProject: "No project",
+    project: "Project",
+    defaultDirectory: "Default directory (server directory)",
+    loadMoreThreads: "Load more conversations",
+    noThreads: "No matching conversations",
+    loadedThreads: "Loaded {count} / {total} conversations",
     selectThread: "Select a conversation",
     syncEvery: "Auto-syncs every 3 seconds",
     pickThread: "Select a Codex conversation from the left.",
@@ -246,6 +333,11 @@ const I18N = {
     imageUnsupported: "Unsupported image format. Use JPEG, PNG, WebP, GIF, HEIC, or BMP.",
     imageDimensionsInvalid: "Unsupported image dimensions. Width and height must be {min}-{max}px.",
     tooManyImages: "You can attach up to {count} images.",
+    modelLabel: "Model",
+    effortLabel: "Reasoning effort",
+    inheritSetting: "Use current",
+    defaultEffort: "Model default",
+    modelLoadFailed: "Models unavailable, click to retry",
     sendToCodex: "Send to current Codex window",
     readonlyPlaceholder: "Read-only: restart without --readonly to send",
     readonly: "Read-only",
@@ -255,13 +347,22 @@ const I18N = {
     syncFailed: "Sync failed",
     syncTemporaryFailed: "Sync temporarily failed",
     emptyThread: "This conversation has no displayable content yet.",
-    contents: "{count} items",
+    contents: "{count} messages loaded",
     thinking: "Thinking...",
+    threadRunning: "Running",
     processing: "Processing",
     sent: "Sent",
+    reasoningLabel: "Reasoning summary",
+    progressLabel: "Progress",
+    answerLabel: "Answer",
+    finalAnswerLabel: "Final answer",
+    loadOlderMessages: "Load earlier messages",
+    loadingOlderMessages: "Loading earlier messages…",
+    historyLoadFailed: "Loading failed; click to retry",
+    historyStart: "Beginning of conversation",
     processed: "Processed",
-    primaryUsage: "Primary usage",
-    longTermUsage: "Long-term usage",
+    primaryUsage: "Remaining quota",
+    longTermUsage: "Long-term remaining quota",
     credit: "Credit",
     unlimitedCredit: "Unlimited",
     balance: "Balance {balance}",
@@ -283,7 +384,9 @@ const I18N = {
     pluginPickerLoading: "Loading plugins...",
     pluginPickerEmpty: "No matching plugins",
     skillPickerTitle: "Mention skill",
+    skillProjectSource: "Project",
     skillPickerLoading: "Loading skills...",
+    skillPickerFailed: "Could not load skills: {message}",
     skillPickerEmpty: "No matching skills",
     untitled: "Untitled",
     separator: " · "
@@ -318,6 +421,27 @@ function clearDraftThread() {
   state.draftStartedAt = 0;
 }
 
+function selectComposerThread(threadId, { moveDraft = false } = {}) {
+  const previousId = state.selectedId;
+  if (previousId === threadId) return;
+  const input = els.composerInput;
+  if (previousId) {
+    if (input.value) state.composerDrafts.set(previousId, input.snapshot ? input.snapshot() : input.value);
+    else state.composerDrafts.delete(previousId);
+  }
+  if (moveDraft && previousId) {
+    if (state.composerDrafts.has(previousId)) state.composerDrafts.set(threadId, state.composerDrafts.get(previousId));
+    state.composerDrafts.delete(previousId);
+  }
+  state.selectedId = threadId;
+  const draft = state.composerDrafts.get(threadId);
+  if (draft && typeof draft === "object") input.restore(draft);
+  else input.value = draft || "";
+  closePluginMentionMenu();
+  closeSkillMentionMenu();
+  autoResizeComposerInput();
+}
+
 function t(key, values = {}) {
   const text = I18N[state.locale][key] || I18N.en[key] || key;
   return text.replace(/\{(\w+)\}/g, (_match, name) => values[name] ?? "");
@@ -340,6 +464,9 @@ function applyStaticText() {
   els.threadCount.textContent = t("loading");
   els.refreshButton.setAttribute("title", t("refresh"));
   els.refreshButton.setAttribute("aria-label", t("refresh"));
+  els.parentThreadButton.setAttribute("title", t("backToParent"));
+  els.parentThreadButton.setAttribute("aria-label", t("backToParent"));
+  els.subagentButton.setAttribute("title", t("viewSubagents"));
   els.sidebarCloseButton?.setAttribute("title", t("hideThreads"));
   els.sidebarCloseButton?.setAttribute("aria-label", t("hideThreads"));
   els.searchInput.placeholder = t("searchThreads");
@@ -347,9 +474,6 @@ function applyStaticText() {
   els.threadList.setAttribute("aria-label", t("threadList"));
   els.threadTitle.textContent = t("selectThread");
   els.threadMeta.textContent = t("syncEvery");
-  document.querySelector("#toolToggleLabel").textContent = "🔧";
-  document.querySelector(".toggle").setAttribute("title", t("tool"));
-  document.querySelector(".toggle").setAttribute("aria-label", t("tool"));
   els.messageList.innerHTML = `<div class="empty-state">${escapeHtml(t("pickThread"))}</div>`;
   els.accountSummary.setAttribute("title", t("showUsage"));
   els.accountSummary.setAttribute("aria-label", t("showUsage"));
@@ -364,6 +488,8 @@ function applyStaticText() {
   els.sendButton.setAttribute("title", t("send"));
   els.sendButton.setAttribute("aria-label", t("send"));
   els.composerInput.placeholder = t("sendToCodex");
+  document.querySelector("#modelLabel").textContent = t("modelLabel");
+  document.querySelector("#effortLabel").textContent = t("effortLabel");
 }
 
 function safeStorageGet(storage, key) {
@@ -388,6 +514,15 @@ function safeStorageRemove(storage, key) {
   } catch {
     // Storage can be unavailable in some mobile privacy modes.
   }
+}
+
+function initProjectPreference() {
+  state.projectFilter = safeStorageGet(localStorage, PROJECT_FILTER_STORAGE_KEY);
+}
+
+function defaultDraftProject() {
+  const projectId = safeStorageGet(localStorage, PROJECT_FILTER_STORAGE_KEY);
+  return state.projects.find((project) => project.id === projectId && project.rootPaths.length) || null;
 }
 
 function initAuthToken() {
@@ -428,10 +563,15 @@ function lockApp(message = "") {
   safeStorageRemove(localStorage, "codexLanToken");
   state.authToken = "";
   state.authLocked = true;
+  state.threadNavigation = [];
+  state.subagents = [];
+  state.subagentMenuOpen = false;
+  renderSubagents();
   state.config = null;
   state.messagesSignature = "";
   state.pendingMessages = [];
   state.lastMessagesData = null;
+  state.messageHistory = null;
   els.rememberDevice.checked = false;
   els.authInput.value = "";
   els.threadCount.textContent = t("needAccessCode");
@@ -474,6 +614,7 @@ function formatDuration(ms) {
 }
 
 function renderApprovalActions(message) {
+  if (isSubagentView()) return "";
   if (message.role !== "interaction" || !message.canApprove || !message.requestId) return "";
   const submission = state.approvalSubmissions[approvalSubmissionKey(state.selectedId, message.requestId)];
   if (submission?.status === "submitted") {
@@ -588,44 +729,20 @@ function pluginIconHtml(plugin, className = "plugin-chip-icon") {
   return `<span class="${className} fallback" aria-hidden="true">${escapeHtml(label)}</span>`;
 }
 
-function pluginMentionMarkdown(plugin) {
-  if (!plugin?.uri) return "";
-  return `[@${plugin.displayName || plugin.name}](${plugin.uri})`;
-}
-
-function renderInlinePluginRefs(html) {
-  return html.replace(/\[@([^\]\n]+)\]\((plugin:\/\/[^)\s]+)\)/g, (_match, label, uri) => {
-    const plugin = state.plugins.find((item) => item.uri === uri);
-    const displayName = plugin?.displayName || label || pluginDisplayNameFromUri(uri);
-    return `<span class="message-plugin-ref">${pluginIconHtml(plugin || { displayName }, "message-plugin-icon")}${escapeHtml(displayName)}</span>`;
-  });
-}
-
 function renderMarkdownLite(text) {
-  const escaped = escapeHtml(text || "");
-  const withPluginRefs = renderInlinePluginRefs(escaped);
-  const withLocalImages = renderGeneratedImageMarkdown(withPluginRefs);
-  const withCodeBlocks = withLocalImages.replace(/```([\s\S]*?)```/g, (_match, code) => `<pre><code>${code.trim()}</code></pre>`);
-  return withCodeBlocks
-    .split(/\n{2,}/)
-    .map((part) => {
-      if (part.startsWith("<pre>")) return part;
-      return `<p>${part.replaceAll("\n", "<br>")}</p>`;
-    })
-    .join("");
-}
-
-function renderGeneratedImageMarkdown(text) {
-  const generatedRoot = "/Users/openclaw/.codex/generated_images/";
-  return String(text || "").replace(
-    /!\[([^\]]*)\]\((\/Users\/openclaw\/\.codex\/generated_images\/[^)\s]+\.(?:png|jpe?g|webp|svg))\)/gi,
-    (_match, alt, imagePath) => {
-      if (!imagePath.startsWith(generatedRoot)) return _match;
+  return renderMarkdown(text, {
+    renderPlugin(label, uri) {
+      return `<span class="message-reference" title="${escapeHtml(uri)}">${escapeHtml(label)}</span>`;
+    },
+    renderSkill(label, skillPath) {
+      return `<span class="message-reference" title="${escapeHtml(skillPath)}">${escapeHtml(label)}</span>`;
+    },
+    renderLocalImage(alt, imagePath) {
       const tokenParam = state.authToken ? `&token=${encodeURIComponent(state.authToken)}` : "";
       const src = `/api/local-image?path=${encodeURIComponent(imagePath)}${tokenParam}`;
-      return `<img class="message-image generated-image" src="${src}" alt="${alt}" loading="lazy" />`;
+      return `<img class="message-image generated-image" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" loading="lazy" />`;
     }
-  );
+  });
 }
 
 function imageNameFromPath(value) {
@@ -648,19 +765,6 @@ function renderMessageImages(message) {
   return `<div class="message-images">${inlineHtml}${localHtml}</div>`;
 }
 
-function renderPromotedToolImages(message) {
-  if (!messageImageCount(message) || state.showTools) return "";
-  const metaBottom = formatMessageDate(message.completedAtMs || message.timestamp);
-  return `
-    <article class="message assistant tool-image">
-      <div class="role">${roleBadge({ role: "assistant" })}</div>
-      <div class="bubble">
-        ${renderMessageImages(message)}
-        ${metaBottom ? `<div class="message-meta message-meta-bottom">${escapeHtml(metaBottom)}</div>` : ""}
-      </div>
-    </article>
-  `;
-}
 
 function mimeTypeForFile(file) {
   if (file.type) return file.type;
@@ -786,6 +890,7 @@ function renderImageAttachments() {
 }
 
 async function addImageFiles(files) {
+  if (els.composerInput.disabled || isSubagentView()) return;
   const incoming = Array.from(files || []);
   if (!incoming.length) return;
   if (state.imageAttachments.length + incoming.length > MAX_IMAGE_ATTACHMENTS) {
@@ -794,6 +899,7 @@ async function addImageFiles(files) {
   }
   try {
     const attachments = (await Promise.all(incoming.map((file) => fileToImageAttachment(file)))).filter(Boolean);
+    if (els.composerInput.disabled) return;
     state.imageAttachments.push(...attachments);
     els.sendStatus.textContent = "";
     renderImageAttachments();
@@ -804,28 +910,46 @@ async function addImageFiles(files) {
 }
 
 function visibleThreads() {
-  const query = state.filter.trim().toLowerCase();
-  const threads = state.draftThread ? [state.draftThread, ...state.threads] : state.threads;
-  if (!query) return threads;
-  return threads.filter((thread) => {
-    return `${thread.title || ""} ${thread.preview || ""} ${thread.cwd || ""}`.toLowerCase().includes(query);
-  });
+  const draft = state.draftThread;
+  const matchesDraft = draft && (!state.projectFilter || (state.projectFilter === "__none__" ? !draft.projectId : draft.projectId === state.projectFilter))
+    && (!state.filter.trim() || `${draft.title} ${draft.projectName || ""} ${draft.cwd}`.toLowerCase().includes(state.filter.trim().toLowerCase()));
+  return matchesDraft ? [draft, ...state.threads] : state.threads;
+}
+
+function renderProjectControls() {
+  const options = state.projects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
+  els.projectFilter.innerHTML = `<option value="">${escapeHtml(t("allProjects"))}</option><option value="__none__">${escapeHtml(t("noProject"))}</option>${options}`;
+  if (state.projectFilter && state.projectFilter !== "__none__" && !state.projects.some((project) => project.id === state.projectFilter)) {
+    els.projectFilter.innerHTML += `<option value="${escapeHtml(state.projectFilter)}">${escapeHtml(t("unavailableProject"))}</option>`;
+  }
+  els.projectFilter.value = state.projectFilter;
+  els.projectFilter.setAttribute("aria-label", t("project"));
+  els.draftProjectField.hidden = state.selectedId !== DRAFT_THREAD_ID;
+  document.querySelector("#draftProjectLabel").textContent = t("project");
+  els.draftProjectSelect.innerHTML = `<option value="">${escapeHtml(t("defaultDirectory"))}</option>` + state.projects
+    .filter((project) => project.rootPaths.length)
+    .map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
+  els.draftProjectSelect.value = state.draftThread?.projectId || "";
+  els.draftProjectSelect.disabled = state.composerBusy || !state.config?.allowWrite;
 }
 
 function renderThreads() {
   const threads = visibleThreads();
-  els.threadCount.textContent = t("conversationsCount", { count: state.threads.length });
-  els.threadList.innerHTML = threads
-    .map((thread) => {
-      const active = thread.id === state.selectedId ? " active" : "";
-      const title = escapeHtml(thread.title || t("untitled"));
-      return `
-        <button class="thread-item${active}${thread.id === DRAFT_THREAD_ID ? " draft" : ""}" data-id="${thread.id}">
+  els.threadCount.textContent = t("loadedThreads", { count: state.threads.length, total: state.threadTotal });
+  els.threadList.innerHTML = threads.map((thread) => {
+    const active = thread.id === state.selectedId ? " active" : "";
+    const title = escapeHtml(thread.title || t("untitled"));
+    return `
+      <button class="thread-item${active}${thread.id === DRAFT_THREAD_ID ? " draft" : ""}" data-id="${escapeHtml(thread.id)}">
+        <span class="thread-title-row">
           <span class="thread-title">${title}</span>
-        </button>
-      `;
-    })
-    .join("");
+          ${thread.status?.running === true ? `<span class="thread-running"><span class="thread-running-dot" aria-hidden="true"></span>${escapeHtml(t("threadRunning"))}</span>` : ""}
+        </span>
+        <span class="thread-project" title="${escapeHtml(thread.cwd || thread.projectName || "")}">${escapeHtml(thread.projectName || t("noProject"))}</span>
+      </button>`;
+  }).join("") || `<p class="thread-list-empty">${escapeHtml(t(state.threadLoading ? "loading" : "noThreads"))}</p>`;
+  if (state.threadHasMore) els.threadList.innerHTML += `<button type="button" class="load-more-threads" ${state.threadLoading ? "disabled" : ""}>${escapeHtml(t(state.threadLoading ? "loading" : "loadMoreThreads"))}</button>`;
+  renderProjectControls();
 }
 
 function renderSidebarState() {
@@ -963,7 +1087,7 @@ function mergePendingMessages(data) {
 function renderCurrentMessages(scrollToBottom = true) {
   const data =
     state.lastMessagesData || {
-      thread: state.selectedId === DRAFT_THREAD_ID ? state.draftThread : state.threads.find((thread) => thread.id === state.selectedId) || null,
+      thread: state.selectedId === DRAFT_THREAD_ID ? state.draftThread : (state.threads.find((thread) => thread.id === state.selectedId) || state.selectedThread) || null,
       messages: [],
       status: state.threadStatus || { thinking: false }
     };
@@ -1033,9 +1157,10 @@ function removePendingMessage(id) {
 }
 
 function renderMessages(data) {
-  const selected = state.selectedId === DRAFT_THREAD_ID ? state.draftThread : state.threads.find((thread) => thread.id === state.selectedId);
+  const selected = state.selectedId === DRAFT_THREAD_ID ? state.draftThread : (state.threads.find((thread) => thread.id === state.selectedId) || state.selectedThread);
   els.threadTitle.textContent = selected?.title || data.thread?.title || t("untitled");
-  const displayMessages = mergePendingMessages(data);
+  const displayMessages = mergePendingMessages(data).filter(isVisibleMessage);
+  const chatMessageCount = displayMessages.filter((message) => message.role === "user" || message.role === "assistant").length;
   const statusText = data.status?.interactionRequired
     ? `${t("separator")}${t("interactionRequired")}`
     : data.status?.thinking
@@ -1043,9 +1168,10 @@ function renderMessages(data) {
         : data.status?.possibleDesktopAttention
           ? `${t("separator")}${t("desktopMayNeedAttention")}`
           : "";
-  els.threadMeta.textContent = `${t("contents", { count: displayMessages.length })}${statusText}`;
+  els.threadMeta.textContent = `${selected?.projectName || t("noProject")}${t("separator")}${t("contents", { count: chatMessageCount })}${statusText}`;
 
-  if (!displayMessages.length && !data.status?.thinking) {
+  renderSubagents();
+  if (!displayMessages.length && !data.status?.thinking && !data.hasMore) {
     els.messageList.innerHTML = `<div class="empty-state">${escapeHtml(state.selectedId === DRAFT_THREAD_ID ? t("newConversationReady") : t("emptyThread"))}</div>`;
     updateScrollToBottomButton();
     return;
@@ -1054,37 +1180,36 @@ function renderMessages(data) {
   let previousUserMessage = null;
   const messageHtml = displayMessages
     .map((message) => {
-      const isTool = message.role === "tool";
+      const assistantStyle = assistantMessageStyle(message);
       const isInteraction = message.role === "interaction";
       const isNotice = message.role === "notice";
       const noticeKey = isNotice ? noticeCollapseKey(message) : "";
       const noticeCollapsed = isNotice && !isImportantNotice(message) && !state.expandedNotices[noticeKey];
-      const hidden = isTool && !state.showTools ? " hidden" : "";
       const title =
         isNotice
           ? renderNoticeTitle(message, noticeCollapsed, noticeKey)
-          : isTool || isInteraction
-            ? `<div class="${isInteraction ? "interaction-title" : "tool-title"}">${escapeHtml(
-                isInteraction ? t("interactionDesktopAction") : message.kind
-              )}${isTool ? `${t("separator")}${escapeHtml(message.title || "")}` : ""}</div>`
+          : isInteraction
+            ? `<div class="interaction-title">${escapeHtml(t("interactionDesktopAction"))}</div>`
           : "";
       const metaTop = messageMetaTop(message, previousUserMessage);
       const metaBottom = formatMessageDate(message.completedAtMs || message.timestamp);
       if (message.role === "user") previousUserMessage = message;
       const messageArticle = `
-        <article class="message ${escapeHtml(message.role)}${message.kind === "pending" ? " pending" : ""}${hidden}">
+        <article${Number.isSafeInteger(message.sourceOffset) ? ` data-source-offset="${message.sourceOffset}"` : ""} class="message ${escapeHtml(message.role)}${message.kind === "pending" ? " pending" : ""}${assistantStyle ? ` ${assistantStyle}` : ""}">
           <div class="role">${roleBadge(message)}</div>
           <div class="bubble">
-            ${metaTop ? `<div class="message-meta message-meta-top">${escapeHtml(metaTop)}</div>` : ""}
+            ${assistantStyle ? `<div class="message-heading"><span class="message-phase">${escapeHtml(t(assistantStyle === "reasoning" ? "reasoningLabel" : assistantStyle === "progress" ? "progressLabel" : message.phase === "final_answer" ? "finalAnswerLabel" : "answerLabel"))}</span>${metaTop ? `<span class="message-meta">${escapeHtml(metaTop)}</span>` : ""}</div>` : metaTop && message.role !== "user" ? `<div class="message-meta message-meta-top">${escapeHtml(metaTop)}</div>` : ""}
             ${title}
             ${message.content && !noticeCollapsed ? renderMarkdownLite(message.content) : ""}
             ${!noticeCollapsed ? renderMessageImages(message) : ""}
             ${renderApprovalActions(message)}
-            ${metaBottom ? `<div class="message-meta message-meta-bottom">${escapeHtml(metaBottom)}</div>` : ""}
+            ${message.role === "user"
+              ? `<div class="message-meta message-meta-bottom user-message-meta"><span>${escapeHtml(metaTop)}</span>${metaBottom ? `<time>${escapeHtml(metaBottom)}</time>` : ""}</div>`
+              : metaBottom ? `<div class="message-meta message-meta-bottom">${escapeHtml(metaBottom)}</div>` : ""}
           </div>
         </article>
       `;
-      return `${messageArticle}${isTool ? renderPromotedToolImages(message) : ""}`;
+      return messageArticle;
     })
     .join("");
   const thinkingHtml = data.status?.thinking
@@ -1098,18 +1223,23 @@ function renderMessages(data) {
       </article>
     `
     : "";
-  els.messageList.innerHTML = `${messageHtml}${thinkingHtml}`;
+  const history = state.messageHistory;
+  const historyHtml = data.hasMore
+    ? `<div class="message-history-controls"><button type="button" class="load-older-messages" ${history?.loading ? "disabled" : ""}>${escapeHtml(t(history?.loading ? "loadingOlderMessages" : history?.error ? "historyLoadFailed" : "loadOlderMessages"))}</button></div>`
+    : history?.expanded ? `<div class="message-history-controls">${escapeHtml(t("historyStart"))}</div>` : "";
+  els.messageList.innerHTML = `${historyHtml}${messageHtml}${thinkingHtml}`;
   updateScrollToBottomButton();
 }
 
 function usageLine(label, window) {
   if (!window) return "";
-  const used = Number.isFinite(Number(window.usedPercent)) ? `${Math.round(Number(window.usedPercent))}%` : "-";
+  const usedPercent = window.usedPercent == null ? NaN : Number(window.usedPercent);
+  const remaining = Number.isFinite(usedPercent) ? `${Math.round(Math.max(0, Math.min(100, 100 - usedPercent)))}%` : "-";
   const reset = formatResetTime(window.resetsAtMs);
   return `
     <div class="usage-row">
       <span>${escapeHtml(label)}</span>
-      <strong>${escapeHtml(used)}</strong>
+      <strong>${escapeHtml(remaining)}</strong>
       <small>${escapeHtml(formatWindow(window.windowMinutes))}${reset ? `${t("separator")}${escapeHtml(t("resetAt", { time: reset }))}` : ""}</small>
     </div>
   `;
@@ -1220,24 +1350,54 @@ async function loadPlugins() {
   }
 }
 
+function syncSkillContext() {
+  const thread = state.lastMessagesData?.thread?.id === state.selectedId
+    ? state.lastMessagesData.thread
+    : state.selectedId === DRAFT_THREAD_ID ? state.draftThread : (state.threads.find((item) => item.id === state.selectedId) || state.selectedThread);
+  const context = JSON.stringify([state.selectedId, thread?.cwd || "", state.codexHomeVersion]);
+  if (context === state.skillsContext) return false;
+  state.skillsContext = context;
+  state.skillsRequest = null;
+  state.skills = [];
+  state.skillsLoaded = false;
+  state.skillsLoading = false;
+  state.skillsError = "";
+  closeSkillMentionMenu();
+  return true;
+}
+
 async function loadSkills() {
-  if (state.skillsLoaded || state.skillsLoading) return;
+  syncSkillContext();
+  if (!state.selectedId || state.skillsLoaded || state.skillsLoading) return;
+  const request = { context: state.skillsContext };
+  state.skillsRequest = request;
   state.skillsLoading = true;
+  state.skillsError = "";
   renderSkillMentionMenu();
   try {
-    const data = await fetchJson("/api/skills");
-    applyHomeContext(data);
+    const query = state.selectedId === DRAFT_THREAD_ID ? (state.draftThread?.projectId ? `?projectId=${encodeURIComponent(state.draftThread.projectId)}` : "") : `?threadId=${encodeURIComponent(state.selectedId)}`;
+    const data = await fetchJson(`/api/skills${query}`);
+    if (state.skillsRequest !== request) return;
+    if (applyHomeContext(data)) {
+      renderComposerMode();
+      return;
+    }
     state.skills = Array.isArray(data.skills) ? data.skills : [];
     state.skillsLoaded = true;
   } catch (error) {
+    if (state.skillsRequest !== request) return;
     if (error.status === 401) {
       lockApp(t("accessCodeWrong"));
       return;
     }
     state.skills = [];
+    state.skillsError = error.message;
   } finally {
-    state.skillsLoading = false;
-    renderSkillMentionMenu();
+    if (state.skillsRequest === request) {
+      state.skillsLoading = false;
+      state.skillsRequest = null;
+      renderSkillMentionMenu();
+    }
   }
 }
 
@@ -1251,10 +1411,25 @@ async function postJson(url, body) {
   if (!response.ok) {
     const error = new Error(data.error || response.statusText);
     error.status = response.status;
+    error.threadId = data.threadId;
     handleUnauthorized(error);
     throw error;
   }
   return data;
+}
+
+function recoverCreatedDraft(error) {
+  if (state.selectedId !== DRAFT_THREAD_ID || !state.draftThread || !error.threadId) return false;
+  const thread = { ...state.draftThread, id: error.threadId };
+  clearDraftThread();
+  selectComposerThread(thread.id, { moveDraft: true });
+  state.selectedThread = thread;
+  state.lastMessagesData = { thread, messages: [], status: { thinking: false } };
+  state.messageHistory = null;
+  state.messagesSignature = "";
+  renderThreads();
+  refreshSoon();
+  return true;
 }
 
 function pluginMentionMatch() {
@@ -1262,7 +1437,7 @@ function pluginMentionMatch() {
   const cursor = input.selectionStart ?? 0;
   const before = input.value.slice(0, cursor);
   const at = before.lastIndexOf("@");
-  if (at < 0) return null;
+  if (at < 0 || input.getMentions?.().some((mention) => mention.start <= at && at < mention.end)) return null;
   const prefix = before.slice(Math.max(0, at - 1), at);
   if (prefix && !/\s/.test(prefix)) return null;
   const query = before.slice(at + 1);
@@ -1274,8 +1449,8 @@ function skillMentionMatch() {
   const input = els.composerInput;
   const cursor = input.selectionStart ?? 0;
   const before = input.value.slice(0, cursor);
-  const slash = before.lastIndexOf("/");
-  if (slash < 0) return null;
+  const slash = Math.max(before.lastIndexOf("/"), before.lastIndexOf("$"));
+  if (slash < 0 || input.getMentions?.().some((mention) => mention.start <= slash && slash < mention.end)) return null;
   const prefix = before.slice(Math.max(0, slash - 1), slash);
   if (prefix && !/\s/.test(prefix)) return null;
   const query = before.slice(slash + 1);
@@ -1356,64 +1531,12 @@ function closeSkillMentionMenu() {
   }
 }
 
-function renderSelectedPlugins() {
-  if (!els.pluginMentionTray) return;
-  els.pluginMentionTray.hidden = state.selectedPlugins.length === 0;
-  els.pluginMentionTray.innerHTML = state.selectedPlugins
-    .map(
-      (plugin) => `
-        <button class="plugin-chip" type="button" data-plugin-uri="${escapeHtml(plugin.uri)}" title="${escapeHtml(plugin.displayName || plugin.name)}">
-          ${pluginIconHtml(plugin)}
-          <span>${escapeHtml(plugin.displayName || plugin.name)}</span>
-          <small aria-hidden="true">×</small>
-        </button>
-      `
-    )
-    .join("");
-}
-
-function renderSelectedSkills() {
-  if (!els.skillMentionTray) return;
-  els.skillMentionTray.hidden = state.selectedSkills.length === 0;
-  els.skillMentionTray.innerHTML = state.selectedSkills
-    .map(
-      (skill) => `
-        <button class="plugin-chip skill-chip" type="button" data-skill-uri="${escapeHtml(skill.uri)}" title="${escapeHtml(skill.displayName || skill.name)}">
-          <span class="plugin-chip-icon skill-chip-icon fallback">/</span>
-          <span>${escapeHtml(skill.displayName || skill.name)}</span>
-          <small aria-hidden="true">×</small>
-        </button>
-      `
-    )
-    .join("");
-}
-
-function clearSelectedPlugins() {
-  state.selectedPlugins = [];
-  renderSelectedPlugins();
-}
-
-function clearSelectedSkills() {
-  state.selectedSkills = [];
-  renderSelectedSkills();
-}
-
-function selectedPluginMarkdown() {
-  return state.selectedPlugins.map((plugin) => pluginMentionMarkdown(plugin)).filter(Boolean).join(" ");
-}
-
-function selectedSkillPrompt() {
-  const names = state.selectedSkills.map((skill) => skill.displayName || skill.name).filter(Boolean);
-  if (!names.length) return "";
-  return `${names.length === 1 ? "Use skill" : "Use skills"}: ${names.join(", ")}.`;
-}
-
 function composerSendMessage(message) {
-  return [selectedSkillPrompt(), selectedPluginMarkdown(), message.trim()].filter(Boolean).join("\n\n").trim();
+  return composerMarkdown(message, els.composerInput.getMentions()).trim();
 }
 
 function hasComposerPayload() {
-  return Boolean(els.composerInput.value.trim() || state.selectedPlugins.length || state.selectedSkills.length || state.imageAttachments.length);
+  return Boolean(els.composerInput.value.trim() || state.imageAttachments.length);
 }
 
 function renderPluginMentionMenu() {
@@ -1461,6 +1584,11 @@ function renderSkillMentionMenu() {
     els.skillMentionMenu.innerHTML = `<div class="plugin-mention-state">${escapeHtml(t("skillPickerLoading"))}</div>`;
     return;
   }
+  if (state.skillsError) {
+    els.skillMentionMenu.hidden = false;
+    els.skillMentionMenu.innerHTML = `<div class="plugin-mention-state">${escapeHtml(t("skillPickerFailed", { message: state.skillsError }))}</div>`;
+    return;
+  }
   const skills = filteredSkills();
   state.skillActiveIndex = Math.max(0, Math.min(state.skillActiveIndex, Math.max(skills.length - 1, 0)));
   els.skillMentionMenu.hidden = false;
@@ -1473,7 +1601,8 @@ function renderSkillMentionMenu() {
     ${skills
       .map((skill, index) => {
         const active = index === state.skillActiveIndex ? " active" : "";
-        const description = skill.description ? `<span>${escapeHtml(skill.description)}</span>` : `<span>${escapeHtml(skill.source || "")}</span>`;
+        const source = skill.scope === "project" ? `${t("skillProjectSource")}: ${skill.source}` : skill.source || "";
+        const description = `<span>${escapeHtml([source, skill.description].filter(Boolean).join(" · "))}</span>`;
         return `
           <button
             class="plugin-mention-item skill-mention-item${active}"
@@ -1481,6 +1610,7 @@ function renderSkillMentionMenu() {
             role="option"
             aria-selected="${index === state.skillActiveIndex ? "true" : "false"}"
             data-skill-index="${index}"
+            title="${escapeHtml(skill.path || source)}"
           >
             <span class="plugin-mention-icon skill-mention-icon fallback">/</span>
             <strong>${escapeHtml(skill.displayName || skill.name)}</strong>
@@ -1557,21 +1687,11 @@ function openSkillPickerMenu() {
 function insertPluginMention(plugin) {
   if (!plugin?.uri) return;
   const input = els.composerInput;
-  if (state.pluginTriggerStart >= 0) {
-    const cursor = input.selectionStart ?? input.value.length;
-    const separator = input.value.slice(cursor).startsWith(" ") || cursor === input.value.length ? "" : " ";
-    const nextValue = `${input.value.slice(0, state.pluginTriggerStart)}${separator}${input.value.slice(cursor)}`;
-    const nextCursor = state.pluginTriggerStart + separator.length;
-    input.value = nextValue;
-    input.setSelectionRange(nextCursor, nextCursor);
-  }
-  if (!state.selectedPlugins.some((item) => item.uri === plugin.uri)) {
-    state.selectedPlugins.push(plugin);
-    renderSelectedPlugins();
-  }
+  const start = state.pluginTriggerStart >= 0 ? state.pluginTriggerStart : input.selectionStart;
+  const end = input.selectionEnd;
+  input.insertMention({ type: "mention", name: plugin.displayName || plugin.name, path: plugin.uri, label: `@${plugin.displayName || plugin.name}` }, start, end);
   closePluginMentionMenu();
   renderComposerMode();
-  input.focus();
 }
 
 function selectActivePluginMention() {
@@ -1583,23 +1703,13 @@ function selectActivePluginMention() {
 }
 
 function insertSkillMention(skill) {
-  if (!skill?.uri) return;
+  if (!skill?.path) return;
   const input = els.composerInput;
-  if (state.skillTriggerStart >= 0) {
-    const cursor = input.selectionStart ?? input.value.length;
-    const separator = input.value.slice(cursor).startsWith(" ") || cursor === input.value.length ? "" : " ";
-    const nextValue = `${input.value.slice(0, state.skillTriggerStart)}${separator}${input.value.slice(cursor)}`;
-    const nextCursor = state.skillTriggerStart + separator.length;
-    input.value = nextValue;
-    input.setSelectionRange(nextCursor, nextCursor);
-  }
-  if (!state.selectedSkills.some((item) => item.uri === skill.uri)) {
-    state.selectedSkills.push(skill);
-    renderSelectedSkills();
-  }
+  const start = state.skillTriggerStart >= 0 ? state.skillTriggerStart : input.selectionStart;
+  const end = input.selectionEnd;
+  input.insertMention({ type: "skill", name: skill.name, path: skill.path, label: `$${skill.name}` }, start, end);
   closeSkillMentionMenu();
   renderComposerMode();
-  input.focus();
 }
 
 function selectActiveSkillMention() {
@@ -1610,26 +1720,105 @@ function selectActiveSkillMention() {
   return true;
 }
 
+function renderModelControls(disabled) {
+  const selected = state.modelSelections.get(state.selectedId) || {};
+  const current = state.modelContext === state.selectedId ? state.currentModelSettings : {};
+  const models = state.modelCatalog;
+  const defaultModel = models.find((model) => model.isDefault);
+  const inheritedModel = current.model || (state.selectedId === DRAFT_THREAD_ID ? defaultModel?.model : "");
+  const activeModel = models.find((model) => model.model === (selected.model || inheritedModel));
+  const inheritedLabel = inheritedModel ? `${t("inheritSetting")} (${inheritedModel})` : t("inheritSetting");
+  const modelOptions = `<option value="">${escapeHtml(inheritedLabel)}</option>` + models.map((model) =>
+    `<option value="${escapeHtml(model.model)}">${escapeHtml(model.displayName)}</option>`).join("");
+  const effort = selected.model ? activeModel?.defaultReasoningEffort : current.effort;
+  const effortLabel = selected.model ? t("defaultEffort") + (effort ? ` (${effort})` : "") : effort || t("inheritSetting");
+  const effortOptions = `<option value="">${escapeHtml(effortLabel)}</option>`
+    + (activeModel?.supportedReasoningEfforts || []).map((value) =>
+      `<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`).join("");
+  if (els.modelSelect.innerHTML !== modelOptions) els.modelSelect.innerHTML = modelOptions;
+  if (els.effortSelect.innerHTML !== effortOptions) els.effortSelect.innerHTML = effortOptions;
+  els.modelSelect.value = selected.model || "";
+  els.effortSelect.value = selected.effort || "";
+  els.modelSelect.disabled = disabled || state.modelsLoading || !models.length;
+  els.effortSelect.disabled = disabled || state.modelsLoading || !activeModel;
+  const retry = document.querySelector("#modelRetry");
+  retry.hidden = !state.modelsError;
+  retry.textContent = t("modelLoadFailed");
+}
+
+async function loadModelControls(threadId) {
+  const changed = state.modelContext !== threadId;
+  state.modelContext = threadId;
+  state.modelsLoading = true;
+  state.modelsError = false;
+  if (changed) state.currentModelSettings = {};
+  const version = state.codexHomeVersion;
+  const request = { threadId, version };
+  state.modelsRequest = request;
+  renderComposerMode();
+  try {
+    const query = threadId === DRAFT_THREAD_ID ? "" : `?threadId=${encodeURIComponent(threadId)}`;
+    const data = await fetchJson(`/api/models${query}`);
+    if (state.modelsRequest !== request || state.modelContext !== threadId || state.selectedId !== threadId || state.codexHomeVersion !== version) return;
+    state.modelCatalog = data.models || [];
+    state.currentModelSettings = data.settings || {};
+  } catch (error) {
+    if (state.modelsRequest !== request || state.modelContext !== threadId || state.selectedId !== threadId || state.codexHomeVersion !== version) return;
+    state.modelsError = true;
+    handleUnauthorized(error);
+  } finally {
+    if (state.modelsRequest === request && state.modelContext === threadId && state.selectedId === threadId && state.codexHomeVersion === version) {
+      state.modelsLoadedAt = Date.now();
+      state.modelsRequest = null;
+      state.modelsLoading = false;
+      renderComposerMode();
+    }
+  }
+}
+
+els.modelSelect.addEventListener("change", () => {
+  const model = state.modelCatalog.find((entry) => entry.model === els.modelSelect.value);
+  state.modelSelections.set(state.selectedId, model ? { model: model.model, effort: model.defaultReasoningEffort } : {});
+  renderComposerMode();
+});
+els.effortSelect.addEventListener("change", () => {
+  const selected = state.modelSelections.get(state.selectedId) || {};
+  const model = selected.model || state.currentModelSettings.model
+    || (state.selectedId === DRAFT_THREAD_ID ? state.modelCatalog.find((entry) => entry.isDefault)?.model : "");
+  if (!model) return;
+  const effort = els.effortSelect.value;
+  state.modelSelections.set(state.selectedId, effort ? { model, effort } : selected.model ? { model } : {});
+  renderComposerMode();
+});
+document.querySelector("#modelRetry").addEventListener("click", () => {
+  if (state.selectedId) void loadModelControls(state.selectedId);
+});
+
 function renderComposerMode() {
-  const allowWrite = Boolean(state.config?.allowWrite);
-  const thinking = Boolean(state.threadStatus?.thinking);
+  const skillContextChanged = syncSkillContext();
+  if (skillContextChanged && state.config?.allowWrite && state.selectedId && !isSubagentView()) loadSkills().catch(() => {});
+  const allowWrite = Boolean(state.config?.allowWrite) && !isSubagentView();
+  const thinking = Boolean(state.threadStatus?.thinking ?? state.selectedThread?.status?.running);
   const hasTarget = Boolean(state.selectedId);
-  const canSend = allowWrite && hasTarget && (thinking || (!state.composerBusy && hasComposerPayload()));
-  els.composerInput.disabled = !allowWrite || state.composerBusy || !hasTarget;
-  els.attachButton.disabled = !allowWrite || state.composerBusy || !hasTarget;
-  els.pluginPickerButton.disabled = !allowWrite || state.composerBusy || !hasTarget;
-  els.skillPickerButton.disabled = !allowWrite || state.composerBusy || !hasTarget;
+  const canSend = allowWrite && hasTarget && !state.composerBusy && (thinking || hasComposerPayload());
+  const inputDisabled = !allowWrite || state.composerBusy || thinking || !hasTarget;
+  renderModelControls(inputDisabled);
+  els.composerInput.disabled = inputDisabled;
+  els.attachButton.disabled = inputDisabled;
+  els.pluginPickerButton.disabled = inputDisabled;
+  els.skillPickerButton.disabled = inputDisabled;
   els.sendButton.disabled = !canSend;
   els.sendButton.classList.toggle("stop-mode", allowWrite && thinking);
   els.sendButton.setAttribute("aria-label", allowWrite && thinking ? t("stopCurrentTask") : t("send"));
   els.sendButton.setAttribute("title", allowWrite && thinking ? t("stopCurrentTask") : t("send"));
-  els.composerInput.placeholder = allowWrite ? (state.selectedId === DRAFT_THREAD_ID ? t("newConversationReady") : t("sendToCodex")) : t("readonlyPlaceholder");
-  if (!allowWrite) els.sendStatus.textContent = t("readonly");
-  else if (els.sendStatus.textContent === t("readonly")) els.sendStatus.textContent = "";
+  els.composerInput.placeholder = isSubagentView() ? t("subagentReadonly") : allowWrite ? (state.selectedId === DRAFT_THREAD_ID ? t("newConversationReady") : t("sendToCodex")) : t("readonlyPlaceholder");
+  if (!allowWrite) els.sendStatus.textContent = isSubagentView() ? t("subagentReadonly") : t("readonly");
+  else if ([t("readonly"), t("subagentReadonly")].includes(els.sendStatus.textContent)) els.sendStatus.textContent = "";
   autoResizeComposerInput();
   if (els.composerInput.disabled) {
     closePluginMentionMenu();
     closeSkillMentionMenu();
+    closeImagePickerMenu();
   }
 }
 
@@ -1647,6 +1836,28 @@ function applyHomeContext(data) {
   state.codexHome = data.codexHome || state.codexHome;
   state.codexHomeVersion = Number.isFinite(version) ? version : state.codexHomeVersion;
   if (!changed) return false;
+  state.composerDrafts.clear();
+  state.modelSelections?.clear();
+  state.modelContext = "";
+  state.modelsRequest = null;
+  state.modelsLoadedAt = 0;
+  state.modelsLoading = false;
+  state.modelCatalog = [];
+  state.currentModelSettings = {};
+  els.composerInput.value = "";
+  autoResizeComposerInput();
+  clearDraftThread();
+  state.projects = [];
+  state.threads = [];
+  state.selectedThread = null;
+  state.threadNavigation = [];
+  state.subagents = [];
+  state.subagentMenuOpen = false;
+  renderSubagents();
+  initProjectPreference();
+  state.threadNextOffset = 0;
+  state.threadTotal = 0;
+  state.threadHasMore = false;
   if (!hasActiveDraft()) clearDraftThread();
   state.messagesSignature = "";
   state.threadStatus = null;
@@ -1654,46 +1865,148 @@ function applyHomeContext(data) {
   state.approvalSubmissions = {};
   state.expandedNotices = {};
   state.lastMessagesData = null;
+  state.messageHistory = null;
   state.plugins = [];
   state.pluginsLoaded = false;
   state.pluginsLoading = false;
   state.skills = [];
   state.skillsLoaded = false;
   state.skillsLoading = false;
-  clearSelectedPlugins();
-  clearSelectedSkills();
+  state.skillsContext = "";
+  state.skillsRequest = null;
+  state.skillsError = "";
   closePluginMentionMenu();
   closeSkillMentionMenu();
   els.messageList.innerHTML = `<div class="empty-state">${escapeHtml(t("loading"))}</div>`;
   return true;
 }
 
-async function loadThreads() {
-  const query = state.selectedId ? `?selectedId=${encodeURIComponent(state.selectedId)}` : "";
-  const data = await fetchJson(`/api/threads${query}`);
-  const homeChanged = applyHomeContext(data);
-  if (homeChanged) loadAccount().catch(() => {});
-  state.threads = data.threads || [];
-  const isDraftSelected = hasActiveDraft();
-  if (!isDraftSelected && (homeChanged || !state.threads.some((thread) => thread.id === state.selectedId)) && state.threads[0]) {
-    state.selectedId = state.threads[0].id;
-  }
-  if (!state.threads.length && !isDraftSelected) {
-    state.selectedId = null;
-  }
+async function loadThreads({ append = false } = {}) {
+  const requestId = ++state.threadRequestSeq;
+  const selection = state.selectedId;
+  const filter = state.filter;
+  const projectFilter = state.projectFilter;
+  const targetCount = append ? 50 : Math.max(50, state.threadNextOffset);
+  let offset = append ? state.threadNextOffset : 0;
+  let rows = append ? [...state.threads] : [];
+  state.threadLoading = true;
   renderThreads();
-  noteSyncSuccess("thread");
+  try {
+    let data;
+    do {
+      const query = new URLSearchParams({ offset: String(offset), limit: String(Math.min(50, targetCount - (append ? 0 : offset))), q: filter, projectId: projectFilter });
+      if (selection && selection !== DRAFT_THREAD_ID) query.set("selectedId", selection);
+      data = await fetchJson(`/api/threads?${query}`);
+      if (requestId !== state.threadRequestSeq) return;
+      const homeChanged = applyHomeContext(data);
+      if (homeChanged) {
+        selectComposerThread(null);
+        loadAccount().catch(() => {});
+        return await loadThreads();
+      }
+      rows.push(...(data.threads || []));
+      offset = data.nextOffset;
+    } while (!append && data.hasMore && offset < targetCount);
+    state.threads = [...new Map(rows.map((row) => [row.id, row])).values()];
+    state.projects = data.projects || [];
+    state.threadTotal = data.total;
+    state.threadNextOffset = offset;
+    state.threadHasMore = data.hasMore;
+    // A search, filter or page change must not switch the open conversation.
+    if (state.selectedId === selection) state.selectedThread = data.selectedThread;
+    if (state.selectedId === selection && !hasActiveDraft()) {
+      if (selection && !data.selectedThread) selectComposerThread(null);
+      if (!state.selectedId && state.threads[0]) selectComposerThread(state.threads[0].id);
+    }
+    renderComposerMode();
+    noteSyncSuccess("thread");
+  } finally {
+    if (requestId === state.threadRequestSeq) {
+      state.threadLoading = false;
+      renderThreads();
+    }
+  }
 }
 
 function renderTransientSyncError(error) {
-  const selected = state.threads.find((thread) => thread.id === state.selectedId);
+  const selected = (state.threads.find((thread) => thread.id === state.selectedId) || state.selectedThread);
   const title = selected?.title || els.threadTitle.textContent || t("selectThread");
   els.threadTitle.textContent = title;
   els.threadMeta.textContent = `${t("syncTemporaryFailed")}${t("separator")}${error.message}`;
 }
 
+function captureMessageAnchor() {
+  const top = els.messageList.getBoundingClientRect().top;
+  const article = [...els.messageList.querySelectorAll("[data-source-offset]")]
+    .find((element) => element.getBoundingClientRect().bottom > top);
+  return {
+    offset: article?.dataset.sourceOffset,
+    top: article?.getBoundingClientRect().top,
+    scrollTop: els.messageList.scrollTop,
+    height: els.messageList.scrollHeight
+  };
+}
+
+function restoreMessageAnchor(anchor, prepend = false) {
+  const article = anchor.offset == null ? null : els.messageList.querySelector(`[data-source-offset="${anchor.offset}"]`);
+  if (article) els.messageList.scrollTop += article.getBoundingClientRect().top - anchor.top;
+  else els.messageList.scrollTop = anchor.scrollTop + (prepend ? els.messageList.scrollHeight - anchor.height : 0);
+}
+
+async function loadOlderMessages() {
+  const history = state.messageHistory;
+  const current = state.lastMessagesData;
+  if (!history || history.loading || !current?.hasMore || current.nextBefore == null || history.threadId !== state.selectedId) return;
+  const before = current.nextBefore;
+  history.loading = true;
+  history.error = "";
+  const button = els.messageList.querySelector(".load-older-messages");
+  if (button) {
+    button.disabled = true;
+    button.textContent = t("loadingOlderMessages");
+  }
+  try {
+    const query = new URLSearchParams({ limit: String(MESSAGE_SYNC_LIMIT), before: String(before) });
+    const page = await fetchJson(`/api/threads/${history.threadId}/messages?${query}`);
+    if (state.messageHistory !== history || state.selectedId !== history.threadId) return;
+    if (history.fileId && page.historyFileId !== history.fileId) throw new Error("Conversation file changed; reload the conversation.");
+    if (page.hasMore && !(page.nextBefore < before)) throw new Error("History cursor did not advance.");
+    const anchor = captureMessageAnchor();
+    const latest = state.lastMessagesData;
+    state.lastMessagesData = {
+      ...latest,
+      messages: mergeMessageHistory(page.messages, latest.messages),
+      hasMore: page.hasMore,
+      nextBefore: page.nextBefore
+    };
+    history.expanded = true;
+    history.loading = false;
+    renderMessages(state.lastMessagesData);
+    restoreMessageAnchor(anchor, true);
+    updateScrollToBottomButton();
+  } catch (error) {
+    if (state.messageHistory !== history) return;
+    if (handleUnauthorized(error)) return;
+    history.error = error.message;
+  } finally {
+    history.loading = false;
+    if (state.messageHistory === history) {
+      const button = els.messageList.querySelector(".load-older-messages");
+      if (button) {
+        button.disabled = false;
+        button.textContent = t(history.error ? "historyLoadFailed" : "loadOlderMessages");
+      }
+    }
+  }
+}
+
 async function loadMessages(force = false, threadId = state.selectedId) {
   if (!threadId) return;
+  if (state.messageHistory?.threadId !== threadId) state.messageHistory = { threadId, expanded: false, loading: false, error: "" };
+  const history = state.messageHistory;
+  if (state.modelContext !== threadId || (!state.modelsLoading && Date.now() - (state.modelsLoadedAt || 0) >= 30000)) {
+    void loadModelControls(threadId);
+  }
   const request = { id: ++state.messageRequestSeq, threadId };
   state.activeMessageRequest = request;
   if (threadId === DRAFT_THREAD_ID) {
@@ -1712,16 +2025,36 @@ async function loadMessages(force = false, threadId = state.selectedId) {
   try {
     const data = await fetchJson(`/api/threads/${threadId}/messages?limit=${MESSAGE_SYNC_LIMIT}`);
     if (state.selectedId !== threadId || state.activeMessageRequest !== request) return;
+    const previous = state.lastMessagesData;
+    if (history.fileId && data.historyFileId !== history.fileId) {
+      // A replaced rollout invalidates byte cursors and cached history.
+      state.messageHistory = null;
+      state.lastMessagesData = null;
+      state.messagesSignature = "";
+      return loadMessages(true, threadId);
+    }
+    history.fileId = data.historyFileId;
+    if (history.expanded && previous) {
+      data.messages = mergeMessageHistory(previous.messages, data.messages);
+      data.hasMore = previous.hasMore;
+      data.nextBefore = previous.nextBefore;
+    }
     state.lastMessagesData = data;
+    state.selectedThread = { ...state.selectedThread, ...data.thread };
+    state.subagents = data.thread?.subagents || [];
+    renderSubagents();
     state.threadStatus = data.status || null;
     renderComposerMode();
-    const signature = `${data.thread?.updatedAtMs || ""}:${data.size || ""}:${data.mtimeMs || ""}:${state.showTools}:${data.status?.thinking ? "thinking" : "idle"}:${data.status?.interactionRequired ? "interaction" : "clear"}:${data.status?.turnId || ""}:${pendingSignature()}`;
+    const signature = `${data.thread?.updatedAtMs || ""}:${data.size || ""}:${data.mtimeMs || ""}:${data.status?.thinking ? "thinking" : "idle"}:${data.status?.interactionRequired ? "interaction" : "clear"}:${data.status?.turnId || ""}:${pendingSignature()}`;
     if (force || signature !== state.messagesSignature) {
       const wasNearBottom = isMessageListNearBottom();
+      const anchor = captureMessageAnchor();
       state.messagesSignature = signature;
       renderMessages(data);
       if (wasNearBottom || force) {
         els.messageList.scrollTop = els.messageList.scrollHeight;
+      } else {
+        restoreMessageAnchor(anchor);
       }
       updateScrollToBottomButton();
     }
@@ -1809,15 +2142,122 @@ function shouldRefocusComposer() {
   return window.matchMedia("(hover: hover) and (pointer: fine)").matches;
 }
 
+function isSubagentView() {
+  return Boolean(state.threadNavigation?.length || state.selectedThread?.isSubagent);
+}
+
+function renderSubagents() {
+  els.parentThreadButton.hidden = !state.threadNavigation.length;
+  els.subagentButton.hidden = !state.subagents.length;
+  const running = state.subagents.filter((thread) => thread.status?.running === true).length;
+  const completed = state.subagents.filter((thread) => thread.status?.completed === true).length;
+  const label = t("subagentCounts", { running, completed });
+  els.subagentCounts.innerHTML = `<span>${escapeHtml(t("subagentRunningCount", { count: running }))}</span><span>${escapeHtml(t("subagentCompletedCount", { count: completed }))}</span>`;
+  els.subagentButton.setAttribute("aria-label", `${t("viewSubagents")}: ${label}`);
+  els.subagentButton.setAttribute("aria-expanded", String(state.subagentMenuOpen));
+  els.subagentMenu.hidden = !state.subagentMenuOpen || !state.subagents.length;
+  els.subagentMenu.innerHTML = state.subagents.map((thread) => {
+    const status = thread.status?.running === true ? "subagentRunning" : thread.status?.completed ? "subagentCompleted" : thread.status?.running === false ? "subagentIdle" : "subagentUnknown";
+    return `<button type="button" class="subagent-item" data-id="${escapeHtml(thread.id)}"><span>${escapeHtml(thread.title)}</span><small>${escapeHtml(t(status))}</small></button>`;
+  }).join("");
+}
+
+function openSubagent(thread) {
+  if (!thread || thread.id === state.selectedId || state.composerBusy) return;
+  state.threadNavigation.push({
+    selectedId: state.selectedId, selectedThread: state.selectedThread,
+    lastMessagesData: state.lastMessagesData, messageHistory: state.messageHistory,
+    messagesSignature: state.messagesSignature, threadStatus: state.threadStatus,
+    subagents: state.subagents, scrollTop: els.messageList.scrollTop,
+    imageAttachments: state.imageAttachments
+  });
+  selectComposerThread(thread.id);
+  state.selectedThread = { ...thread, isSubagent: true };
+  state.lastMessagesData = null;
+  state.messageHistory = null;
+  state.messagesSignature = "";
+  state.threadStatus = null;
+  state.subagents = [];
+  state.subagentMenuOpen = false;
+  state.imageAttachments = [];
+  closeImagePickerMenu();
+  closeAccountPanel();
+  renderImageAttachments();
+  renderSubagents();
+  renderThreads();
+  renderMessages({ thread: state.selectedThread, messages: [] });
+  renderComposerMode();
+  loadMessages(true, thread.id).catch(handleUnauthorized);
+}
+
+function returnToParent() {
+  if (state.composerBusy) return;
+  const parent = state.threadNavigation.pop();
+  if (!parent) return;
+  selectComposerThread(parent.selectedId);
+  Object.assign(state, {
+    selectedThread: parent.selectedThread,
+    lastMessagesData: parent.lastMessagesData, messageHistory: parent.messageHistory,
+    messagesSignature: parent.messagesSignature, threadStatus: parent.threadStatus,
+    subagents: parent.subagents, subagentMenuOpen: false, imageAttachments: parent.imageAttachments
+  });
+  // Refresh discovery for the parent; its inline references were restored with its draft.
+  renderComposerMode();
+  renderImageAttachments();
+  renderSubagents();
+  renderThreads();
+  renderMessages(parent.lastMessagesData || { thread: parent.selectedThread, messages: [] });
+  els.messageList.scrollTop = parent.scrollTop;
+  renderComposerMode();
+  loadMessages(false, state.selectedId).catch(handleUnauthorized);
+}
+
+function closeSubagentMenuOnOutsideClick(event) {
+  const path = event.composedPath();
+  if (state.subagentMenuOpen && !path.includes(els.subagentButton) && !path.includes(els.subagentMenu)) {
+    state.subagentMenuOpen = false;
+    renderSubagents();
+  }
+}
+
+els.subagentButton.addEventListener("click", () => {
+  if (state.subagents.length === 1) return openSubagent(state.subagents[0]);
+  state.subagentMenuOpen = !state.subagentMenuOpen;
+  renderSubagents();
+  if (state.subagentMenuOpen) els.subagentMenu.querySelector("button")?.focus();
+});
+els.subagentMenu.addEventListener("click", (event) => {
+  const button = event.target.closest(".subagent-item");
+  if (button) openSubagent(state.subagents.find((thread) => thread.id === button.dataset.id));
+});
+els.parentThreadButton.addEventListener("click", returnToParent);
+document.addEventListener("click", closeSubagentMenuOnOutsideClick);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.subagentMenuOpen) {
+    state.subagentMenuOpen = false;
+    renderSubagents();
+    els.subagentButton.focus();
+  }
+});
+
 els.threadList.addEventListener("click", (event) => {
+  if (event.target.closest(".load-more-threads")) {
+    if (!state.threadLoading) loadThreads({ append: true }).catch(renderTransientSyncError);
+    return;
+  }
   const button = event.target.closest(".thread-item");
-  if (!button) return;
-  state.selectedId = button.dataset.id;
+  if (!button || state.composerBusy) return;
+  state.threadNavigation = [];
+  state.subagents = [];
+  state.subagentMenuOpen = false;
+  renderSubagents();
+  selectComposerThread(button.dataset.id);
+  state.selectedThread = state.threads.find((thread) => thread.id === state.selectedId) || null;
   if (state.selectedId !== DRAFT_THREAD_ID) clearDraftThread();
-  clearSelectedPlugins();
   state.messagesSignature = "";
   state.threadStatus = null;
   state.lastMessagesData = null;
+  state.messageHistory = null;
   els.sendStatus.textContent = "";
   renderComposerMode();
   renderThreads();
@@ -1827,16 +2267,23 @@ els.threadList.addEventListener("click", (event) => {
 
 els.newThreadButton.addEventListener("click", () => {
   if (!state.config?.allowWrite || els.newThreadButton.disabled) return;
+  state.threadNavigation = [];
+  state.subagents = [];
+  state.subagentMenuOpen = false;
+  renderSubagents();
   els.sendStatus.textContent = "";
-  clearSelectedPlugins();
   state.draftThread = {
     id: DRAFT_THREAD_ID,
     title: t("newConversationDraft"),
     preview: "",
-    cwd: ""
+    cwd: "",
+    projectId: "",
+    projectName: ""
   };
+  const project = defaultDraftProject();
+  if (project) Object.assign(state.draftThread, { projectId: project.id, projectName: project.name, cwd: project.rootPaths[0] });
   state.draftStartedAt = Date.now();
-  state.selectedId = DRAFT_THREAD_ID;
+  selectComposerThread(DRAFT_THREAD_ID);
   state.messagesSignature = "";
   state.threadStatus = { thinking: false };
   state.lastMessagesData = {
@@ -1874,6 +2321,7 @@ els.messageList.addEventListener("pointerdown", () => {
 
 els.messageList.addEventListener("scroll", () => {
   updateScrollToBottomButton();
+  if (els.messageList.scrollTop < 80 && !state.messageHistory?.error) loadOlderMessages();
 });
 
 els.scrollToBottomButton.addEventListener("click", () => {
@@ -1881,6 +2329,10 @@ els.scrollToBottomButton.addEventListener("click", () => {
 });
 
 els.messageList.addEventListener("click", async (event) => {
+  if (event.target.closest(".load-older-messages")) {
+    await loadOlderMessages();
+    return;
+  }
   const noticeButton = event.target.closest(".notice-collapse-button");
   if (noticeButton) {
     event.preventDefault();
@@ -1896,7 +2348,7 @@ els.messageList.addEventListener("click", async (event) => {
   if (!button) return;
   event.preventDefault();
   event.stopPropagation();
-  if (!state.config?.allowWrite || button.disabled) return;
+  if (!state.config?.allowWrite || button.disabled || isSubagentView()) return;
   const container = button.closest(".approval-actions");
   const requestId = container?.dataset.requestId || "";
   const approvalKind = container?.dataset.approvalKind || "command";
@@ -1943,16 +2395,38 @@ window.addEventListener("resize", () => {
   updateScrollToBottomButton();
 });
 
+let threadSearchTimer;
+function reloadThreadFilter() {
+  clearTimeout(threadSearchTimer);
+  state.threadRequestSeq += 1;
+  state.threadNextOffset = 0;
+  state.threadTotal = 0;
+  state.threads = [];
+  state.threadHasMore = false;
+  renderThreads();
+  threadSearchTimer = setTimeout(() => loadThreads().catch(renderTransientSyncError), 250);
+}
+
 els.searchInput.addEventListener("input", (event) => {
   state.filter = event.target.value;
-  renderThreads();
+  reloadThreadFilter();
 });
 
-els.toolToggle.addEventListener("change", (event) => {
-  state.showTools = event.target.checked;
-  state.messagesSignature = "";
-  loadMessages(true);
+els.projectFilter.addEventListener("change", (event) => {
+  state.projectFilter = event.target.value;
+  safeStorageSet(localStorage, PROJECT_FILTER_STORAGE_KEY, state.projectFilter);
+  reloadThreadFilter();
 });
+
+els.draftProjectSelect.addEventListener("change", (event) => {
+  if (!state.draftThread || state.composerBusy) return;
+  const project = state.projects.find((item) => item.id === event.target.value);
+  Object.assign(state.draftThread, { projectId: project?.id || "", projectName: project?.name || "", cwd: project?.rootPaths[0] || "" });
+  renderThreads();
+  renderComposerMode();
+  renderCurrentMessages(true);
+});
+
 
 els.accountSummary.addEventListener("click", () => {
   state.accountExpanded = !state.accountExpanded;
@@ -2047,6 +2521,7 @@ els.authForm.addEventListener("submit", async (event) => {
 });
 
 els.composerInput.addEventListener("keydown", (event) => {
+  if (event.isComposing || event.keyCode === 229) return;
   if (state.pluginMenuOpen) {
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
@@ -2148,24 +2623,6 @@ els.skillMentionMenu?.addEventListener("click", (event) => {
   insertSkillMention(skill);
 });
 
-els.pluginMentionTray?.addEventListener("click", (event) => {
-  const button = event.target.closest(".plugin-chip");
-  if (!button) return;
-  state.selectedPlugins = state.selectedPlugins.filter((plugin) => plugin.uri !== button.dataset.pluginUri);
-  renderSelectedPlugins();
-  renderComposerMode();
-  els.composerInput.focus();
-});
-
-els.skillMentionTray?.addEventListener("click", (event) => {
-  const button = event.target.closest(".skill-chip");
-  if (!button) return;
-  state.selectedSkills = state.selectedSkills.filter((skill) => skill.uri !== button.dataset.skillUri);
-  renderSelectedSkills();
-  renderComposerMode();
-  els.composerInput.focus();
-});
-
 els.attachButton.addEventListener("click", () => {
   if (els.attachButton.disabled) return;
   closePluginMentionMenu();
@@ -2202,21 +2659,18 @@ els.attachmentTray.addEventListener("click", (event) => {
 els.composerForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   closePluginMentionMenu();
-  if (!state.config?.allowWrite) return;
-  const thinking = Boolean(state.threadStatus?.thinking);
-  if (state.composerBusy && !thinking) return;
+  if (!state.config?.allowWrite || isSubagentView()) return;
+  const thinking = Boolean(state.threadStatus?.thinking ?? state.selectedThread?.status?.running);
+  if (state.composerBusy) return;
   const isDraftThread = state.selectedId === DRAFT_THREAD_ID;
-  const message = els.composerInput.value.trim();
+  const message = els.composerInput.value;
   const sendMessage = composerSendMessage(message);
   const images = [...state.imageAttachments];
   if (!thinking && !sendMessage && !images.length) return;
-  if (thinking && (sendMessage || images.length)) {
-    els.sendStatus.textContent = t("busyCannotSend");
-    return;
-  }
   const previousThreadStatus = state.threadStatus;
   const pendingMessageId = thinking || isDraftThread ? null : addPendingUserMessage(state.selectedId, sendMessage, images);
   state.composerBusy = true;
+  renderProjectControls();
   if (!thinking && !isDraftThread) {
     state.threadStatus = { ...(state.threadStatus || {}), thinking: true, possibleDesktopAttention: false };
     state.messagesSignature = "";
@@ -2236,17 +2690,22 @@ els.composerForm.addEventListener("submit", async (event) => {
         message: sendMessage,
         threadId: isDraftThread ? null : state.selectedId,
         newThread: isDraftThread,
+        projectId: isDraftThread ? state.draftThread?.projectId || "" : "",
+        ...state.modelSelections.get(state.selectedId),
         images: images.map(({ name, mimeType, data }) => ({ name, mimeType, data }))
       });
+      state.currentModelSettings = { ...state.currentModelSettings, ...state.modelSelections.get(state.selectedId) };
+      state.composerDrafts.delete(state.selectedId);
       els.composerInput.value = "";
       autoResizeComposerInput();
-      clearSelectedPlugins();
-      clearSelectedSkills();
       state.imageAttachments = [];
       renderImageAttachments();
       if (isDraftThread && result.threadId) {
+        const modelSelection = state.modelSelections.get(DRAFT_THREAD_ID);
+        if (modelSelection) state.modelSelections.set(result.threadId, modelSelection);
+        state.modelSelections.delete(DRAFT_THREAD_ID);
         clearDraftThread();
-        state.selectedId = result.threadId;
+        selectComposerThread(result.threadId);
         state.pendingMessages = state.pendingMessages.filter((pending) => pending.id !== pendingMessageId);
         await loadThreads();
       }
@@ -2256,6 +2715,7 @@ els.composerForm.addEventListener("submit", async (event) => {
     }
   } catch (error) {
     if (pendingMessageId) removePendingMessage(pendingMessageId);
+    if (isDraftThread) recoverCreatedDraft(error);
     if (!thinking) {
       state.threadStatus = previousThreadStatus;
       state.messagesSignature = "";
@@ -2270,6 +2730,7 @@ els.composerForm.addEventListener("submit", async (event) => {
     els.sendStatus.textContent = t(thinking ? "interruptFailed" : "sendFailed", { message: error.message });
   } finally {
     state.composerBusy = false;
+    renderProjectControls();
     renderComposerMode();
     if (!thinking && shouldRefocusComposer()) els.composerInput.focus();
   }
@@ -2278,6 +2739,7 @@ els.composerForm.addEventListener("submit", async (event) => {
 applyStaticText();
 configureImageInput();
 initAuthToken();
+initProjectPreference();
 initResponsiveSidebar();
 
 async function bootstrap() {

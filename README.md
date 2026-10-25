@@ -8,7 +8,40 @@
 
 Codex LAN Companion is a small self-hosted web service for viewing and lightly controlling Codex Desktop from another device on the same LAN. It is designed for local/home-network use: start it on the Mac that runs Codex Desktop, then open the companion UI from any browser device on the same network: phone, tablet, Windows PC, Linux laptop, smart display, Kindle/e-reader, or anything else with a usable web browser.
 
-This is an unofficial tool. It reads local Codex Desktop state and, by default, can use local Codex Desktop IPC to send messages from the LAN web UI. Start with `--readonly` if you only want to view conversations.
+This is an unofficial tool. It reads local Codex Desktop state and, by default, can use local Codex Desktop IPC or the bundled CLI App Server to send messages from the LAN web UI. Start with `--readonly` if you only want to view conversations.
+
+The composer locks message input, attachments, plugin/skill insertion, and model controls while the selected conversation is running; the stop button remains available. The model and reasoning effort selectors use the local Codex catalog and apply your choices with the next message, including the first message of a new conversation. Leave them on “Use current” to inherit the conversation settings. Available efforts depend on the model. Permission settings remain managed by Codex Desktop. If the catalog cannot be loaded, retry from the composer; sending with inherited settings still works.
+
+Plan quota percentages show the remaining allowance (100% minus usage) for both windows; missing records display “-”.
+
+The reasoning selector displays a known conversation effort directly, preferring Desktop settings and falling back to recent conversation metadata. It refreshes while viewing the conversation and keeps “Use current” when the effort cannot be determined.
+
+## Fork updates · 2026-10-25
+
+This fork is maintained at [luyunyu/codex-lan-companion](https://github.com/luyunyu/codex-lan-companion), based on [dreamingboat/codex-lan-companion](https://github.com/dreamingboat/codex-lan-companion) at `de6ada9`. The upstream project provides the original LAN companion; this fork adds the following improvements:
+
+| Area | Updates in this fork |
+| --- | --- |
+| Projects and conversations | Show project membership; remember the selected project; search and page conversations in batches of 50; display running status; choose an existing local project when creating a conversation. |
+| Message reading | User-only bubbles and safe Markdown; distinguish reasoning summaries, progress and final answers; load 40 displayable messages per page and fetch older history on demand while preserving scroll position. |
+| Display filtering | Hide internal roles, injected instructions and tool records from browser responses without changing the original conversation or model context; retain approvals and important notices. |
+| Subagents | Keep child conversations out of the main sidebar; show running/completed counts, open children read-only and return with the parent draft and history restored. |
+| Composer and skills | Keep drafts per conversation within the page; insert blue skill/plugin references at the caret; use native structured input and the enabled, project-scoped skill catalog; reject stale references before sending. |
+| Models and quota | Choose model and reasoning effort for the next message; recover actual conversation effort when available; lock input during execution; show remaining plan quota. |
+| New conversation compatibility | Fall back to the local App Server when legacy Desktop creation IPC is unavailable, validate directory and project membership, execute in the background and notify Desktop without switching conversations. |
+
+Validation for this update: syntax checks and 104 automated tests pass; 2 opt-in CLI integration tests are skipped by default. Earlier development sessions exercised browser layouts, new-conversation creation and skill injection on this machine. This is not a guarantee of compatibility with every Desktop build; private IPC and storage formats can change. See [CHANGELOG.md](CHANGELOG.md) for details and the sections below for behavior and limitations.
+
+To run this fork from source:
+
+```bash
+git clone https://github.com/luyunyu/codex-lan-companion.git
+cd codex-lan-companion
+npm ci
+npm start
+```
+
+For automatic startup after macOS login, run `npm run service:install` in this checkout. It starts the service immediately and replaces any existing companion LaunchAgent with the same name. Access-code authentication remains enabled by default; use the background-service section below for status, logs and removal.
 
 ## Why
 
@@ -22,9 +55,9 @@ Codex Desktop is powerful, but long-running tasks can keep you tied to the Mac. 
 - **Workflow-aware:** shows thinking state, account/usage information, plugin picker, and skill picker
 - **Easy onboarding:** terminal access code plus QR sign-in
 
-## First Release Notice
+## Upstream First Release Notice
 
-This repository is being prepared as the first public release of Codex LAN Companion.
+The following compatibility note describes the upstream first release, rather than a new compatibility certification for this fork.
 
 Important compatibility note: this first release was developed and verified only with the latest Codex Desktop available to the author at release time: Codex Desktop `26.601.21317` on macOS, tested on 2026-06-03. Codex Desktop local files and IPC are private implementation details, not public compatibility contracts. Newer Codex Desktop versions may change these interfaces and may partially or completely break this companion. If that happens, update this project against the new Codex Desktop behavior before relying on it.
 
@@ -33,11 +66,14 @@ Important compatibility note: this first release was developed and verified only
 - LAN browser UI for Codex Desktop conversations
 - Browser-device access across the LAN: macOS, Windows, Linux, phones, tablets, Kindle/e-readers, smart displays, and more
 - Mobile-friendly conversation list and message view
+- Codex-style messages with user-only bubbles, hidden internal roles and injected AGENTS.md/environment/Page UI context and standalone skill instructions, and Markdown headings, lists, code, quotes, tables and safe links
 - Live-ish sync, including an active "thinking" indicator
-- Performance-oriented recent-message sync for long conversations
+- Subagent conversations stay out of the sidebar. The parent header shows running/completed counts; click to choose and view a child, including archived children, then go back to restore the parent's unsent input. Child conversations are view-only. Refresh is beside Skills below the composer.
+- Performance-oriented recent-message sync with backward pagination for older history
 - Account and local plan-usage summary when available from Codex local state
-- Plugin picker in the composer, including friendly plugin chips
-- Skill picker in the composer, including `/` trigger and friendly skill chips
+- Unsent text and inline references are kept per conversation in the current page and restored when switching back; refreshing the page or switching accounts clears it.
+- Inline blue plugin references in the composer and sent messages
+- Inline blue skill references, with `$` and `/` picker triggers and native structured skill input
 - Image attachments when writable
 - Approval and important notice display when detectable from Codex Desktop events
 - New conversation creation from the web UI
@@ -72,13 +108,13 @@ Prerequisites:
 Run the current GitHub release without installing globally:
 
 ```bash
-npx github:dreamingboat/codex-lan-companion
+npx github:luyunyu/codex-lan-companion
 ```
 
 Or install once and then run it:
 
 ```bash
-npm install -g github:dreamingboat/codex-lan-companion
+npm install -g github:luyunyu/codex-lan-companion
 codex-lan-companion
 ```
 
@@ -124,6 +160,16 @@ QR:     opens the LAN page and signs in automatically
 
 Open the LAN URL from any browser device on the same Wi-Fi, or scan the terminal QR code from a camera-capable device to open and sign in automatically. When no password is provided, the service generates a short 6-digit numeric code each time it starts. The QR code contains a temporary sign-in URL for the current launch; after the browser opens it, the page removes the login parameter from the address bar. By default the code is kept only in page memory, so reloading or reopening the page asks again. Check "Remember this device" on the login screen if you want the browser to keep it across restarts.
 
+The sidebar shows each conversation's project and supports filtering by project or searching titles, previews, directories and project names. The last sidebar project selection is saved in this browser's LocalStorage and applied to the initial load, refreshes and subsequent polls. It initially loads 50 conversations; **Load more conversations** fetches the next batch. Polling refreshes only the loaded window. The server still merges and caches conversation metadata from SQLite, the session index and Desktop IPC before slicing each response; this is not database-level lazy loading. The former 500-row database cutoff is removed so older conversations keep their metadata and archive visibility.
+
+List polling adds or removes a **Running** badge using local task lifecycle events for the requested page only. Each file read is capped at 512 KiB with incremental status caching; the list does not load full message bodies. Completion or interruption clears the badge on the next poll; tasks with no activity for 10 minutes stop being shown as running. Missing records or insufficient evidence in the bounded window produce no badge, so absence of a badge does not confirm that a conversation is idle.
+
+After choosing **New conversation**, the saved sidebar project is selected by default. The picker shows project names only and lets you choose another existing local project for this conversation. **All projects** and **No project** use the default creation directory. The selection controls the working directory, workspace roots, project assignment and available skills when the first message creates the Desktop conversation. Projects without local directories cannot be used for creation. Creating projects is not supported.
+
+When the installed Desktop protocol no longer supports the legacy creation IPC, the companion skips it and creates the conversation through the bundled CLI's local App Server. It verifies the selected directory, workspace roots and project ID before submitting the first message in the background. It does not open or switch the Desktop conversation, or call the removed refresh/activation methods. On supported Desktop versions, a lightweight thread-availability notification after persistence and task completion prompts a sidebar metadata refresh while keeping the current conversation selected; unsupported versions rely on their normal sync. Background conversations use the same local Codex home and project instruction discovery; their model and permissions come from the CLI configuration. Subsequent messages, interruptions and command/file/permission approvals for these conversations use the App Server connection. Each turn keeps its connection alive until completion, then closes it to release the writer lock; later turns resume the persisted conversation, including after a companion restart. Restarting the companion or switching Codex homes closes active background connections and can interrupt their work. Other existing Desktop conversations retain the Desktop IPC route.
+
+If the CLI cannot preserve the selected project settings, no message is sent. If creation succeeds but the first message cannot be confirmed, the browser switches to the created conversation and keeps the input; check its messages before retrying. Ambiguous IPC creation timeouts are not automatically retried. Private interfaces still require verification against the installed Desktop version.
+
 ## QR Code Sign-In / 手机扫码登录
 
 Codex LAN Companion prints a QR code in the terminal when it starts. The QR code contains the LAN URL plus a temporary sign-in parameter for the current service launch.
@@ -157,7 +203,11 @@ Use view-only mode:
 codex-lan-companion --readonly
 ```
 
-By default, the web UI can send text, selected plugin or skill mentions, and supported image attachments to Codex Desktop through local Desktop IPC. Codex Desktop should be open and signed in on the Mac running this service. `--readonly` disables sending, interruption, and approval actions from the browser.
+By default, the web UI can send text, selected plugin or skill mentions, and supported image attachments to Codex through local Desktop IPC or the background App Server connection. Codex Desktop should be open and signed in on the Mac running this service. `--readonly` disables sending, interruption, and approval actions from the browser.
+
+The skill picker reads Codex App Server's `skills/list` catalog for the selected conversation's working directory, showing only enabled skills. Codex determines which project, global and plugin skills are available. Cached `SKILL.md` files alone do not make a skill available: old `artifact-template-*` files and disabled skills are excluded. If the native catalog cannot be loaded, discovery reports an error instead of scanning the plugin cache. A send-time check rejects stale skill references before any message or new conversation is submitted.
+
+Switching conversations restores that conversation's unsent text and inline references and reloads the skill list; responses from the previous conversation are ignored. Choose a skill with `$`, `/` or the skill button, and a plugin with `@` or the plugin button. References appear in blue at the cursor position and keep the same labels and order in sent messages. Same-name skills remain separate and show their source in the picker. Sends retain readable Markdown references and include native `{ type: "skill", name, path }` and plugin `{ type: "mention", name, path }` input items through Desktop IPC or App Server, including the first turn of a new conversation. Skill paths identify the exact `SKILL.md`; no English instruction block or JSON is appended to the message text. These private Desktop interfaces remain version-dependent. New conversation drafts use the selected local project's directory, or the companion server's launch directory when the default directory is selected. Conversations without a known working directory show global skills only.
 
 Choose a port or fixed token:
 
@@ -280,14 +330,15 @@ The server never returns Codex auth tokens to the browser.
 
 - Compatibility is tied to Codex Desktop local storage and private IPC behavior. Future Codex Desktop updates may break conversation sync, account display, approvals, plugin mentions, sending, or interruption support.
 - Sync is near-real-time rather than push-perfect. Conversation data is refreshed frequently, but some Codex Desktop UI-only states may appear with delay or may not be detectable.
-- For performance, the web UI syncs a recent message window by default instead of the full conversation history. Older tool messages and ordinary folded notices outside the most recent message range may be omitted from the browser view. Important notices, approval cards, and recent visible user/assistant messages are prioritized.
+- The web UI requests the latest 40 user/assistant messages by default, including readable reasoning summaries and progress updates. Scroll to the top or choose **Load earlier messages** to page backward; polling preserves loaded history and reading position. The server scans complete JSONL records backward in byte-bounded chunks until it finds 40 displayable messages or reaches the beginning, retaining only display and lifecycle data. Tool calls and outputs are filtered on the server, are never sent to the browser, and do not count toward the message limit. Important notices and current approvals are kept separately. Reasoning summaries, progress updates and final answers have distinct labels and styles; encrypted records without readable summaries are omitted. A page contains fewer than 40 messages only when it reaches the beginning with fewer remaining messages. Missing files or messages absent from the original records cannot be recovered.
+- Message hiding and filtering only affect data returned to this browser UI. They do not rewrite Codex rollout files or databases, or change Desktop conversation context. Sending reuses the existing conversation ID and submits only the new message; the 40-message display limit is not the model context limit. Standalone injected skill instructions are hidden, while normal skill selections and references are still sent and take effect.
 - Some Codex Desktop prompts, warnings, or approval states may not be fully actionable from the web UI. Keep Codex Desktop accessible for fallback.
 - New conversations created by the web UI may not appear immediately in Codex Desktop's own sidebar; Codex Desktop appears to refresh its list on its own schedule.
 - This is intended for trusted LAN use. It is not hardened for public internet exposure.
 
 ## Security Notes
 
-This service exposes local Codex conversation titles, messages, tool output, project paths, and account display information to anyone who can access the URL and access code. Use it only on networks you trust.
+This service exposes local Codex conversation titles, messages, approval information, project paths, and account display information to anyone who can access the URL and access code. Use it only on networks you trust.
 
 Recommended defaults:
 

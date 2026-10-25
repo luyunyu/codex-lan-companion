@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFile, spawn } from "node:child_process";
+import { execFile } from "node:child_process";
 import { randomInt, randomUUID } from "node:crypto";
 import { createReadStream, existsSync, promises as fs } from "node:fs";
 import http from "node:http";
@@ -9,7 +9,17 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import qrcode from "qrcode-terminal";
-import { readDesktopIpcVersions, desktopRequestEnvelope, desktopStartTurnParams } from "./lib/desktop-ipc-protocol.js";
+import { readDesktopIpcVersions, desktopRequestEnvelope, desktopStartTurnParams, desktopThreadAvailableBroadcast } from "./lib/desktop-ipc-protocol.js";
+import { desktopUserInput } from "./lib/desktop-user-input.js";
+import { readNativeSkills, assertAvailableSkillReferences } from "./lib/native-skills.js";
+import { AppServerThreadClient } from "./lib/app-server-thread.js";
+import { readModelCatalog, readRolloutModelSettings, mergeModelSettings, validateModelSettings } from "./lib/model-settings.js";
+import { findSkillFiles, projectSkillRoots } from "./lib/skill-discovery.js";
+import { projectCatalog, withThreadProjects, threadPage } from "./lib/thread-projects.js";
+import { ThreadStatusReader } from "./lib/thread-status.js";
+import { stripInjectedUserContext } from "./lib/user-message-content.js";
+import { readRolloutWindow } from "./lib/rollout-history.js";
+import { subagentInfo, sidebarThreadPage, childThreads, SessionMetadataReader } from "./lib/subagent-threads.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -194,7 +204,8 @@ const CODEX_HOME_IPC_SOCKET = process.platform === "win32" ? LEGACY_CODEX_IPC_SO
 const CODEX_IPC_SOCKET = cli.ipcSocket || process.env.CODEX_IPC_SOCKET || (existsSync(CODEX_HOME_IPC_SOCKET) ? CODEX_HOME_IPC_SOCKET : LEGACY_CODEX_IPC_SOCKET);
 const CODEX_CLI_CANDIDATES = [
   "/Applications/Codex.app/Contents/Resources/codex",
-  "/Applications/ChatGPT.app/Contents/Resources/codex"
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
 ];
 const CODEX_CLI = process.env.CODEX_CLI || CODEX_CLI_CANDIDATES.find((candidate) => existsSync(candidate)) || "codex";
 const PUBLIC_DIR = path.join(__dirname, "public");
@@ -203,7 +214,7 @@ const MAX_SEND_IMAGES = 4;
 const MAX_SEND_IMAGE_BYTES = 5 * 1024 * 1024;
 const MAX_SEND_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_LOCAL_IMAGE_BYTES = 10 * 1024 * 1024;
-const DEFAULT_MESSAGE_LIMIT = 80;
+const DEFAULT_MESSAGE_LIMIT = 40;
 const MAX_MESSAGE_LIMIT = 1000;
 const TAIL_ROLLOUT_MIN_BYTES = 512 * 1024;
 const TAIL_ROLLOUT_MAX_BYTES = 4 * 1024 * 1024;
@@ -214,6 +225,8 @@ const MAX_SEND_IMAGE_PIXELS = 12_000_000;
 const SUPPORTED_SEND_IMAGE_MIME_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const ACTIVE_TURN_STALE_MS = 10 * 60 * 1000;
 const ACTIVE_STATUS_CACHE_MS = 5000;
+const threadStatusReader = new ThreadStatusReader({ staleMs: ACTIVE_TURN_STALE_MS });
+const sessionMetadataReader = new SessionMetadataReader();
 const IPC_VERSION_BY_METHOD = {
   "thread-follower-start-turn": 1,
   "thread-follower-interrupt-turn": 1,
@@ -235,6 +248,8 @@ const jsonHeaders = {
 const messageCache = new Map();
 const recentNotices = [];
 let codexIpcClient = null;
+const appServerClients = new Map();
+const appServerThreadIds = new Set();
 let accountCache = null;
 let threadAccountCache = null;
 let threadAccountRefreshInFlight = null;
@@ -342,26 +357,6 @@ async function findPluginManifests(dir, depth = 0) {
   return manifests;
 }
 
-async function findSkillFiles(dir, depth = 0) {
-  if (depth > 8) return [];
-  let entries = [];
-  try {
-    entries = await fs.readdir(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-  const files = [];
-  for (const entry of entries) {
-    const entryPath = path.join(dir, entry.name);
-    if (entry.isFile() && entry.name === "SKILL.md") {
-      files.push(entryPath);
-    } else if (entry.isDirectory() && entry.name !== "node_modules" && entry.name !== ".git") {
-      files.push(...(await findSkillFiles(entryPath, depth + 1)));
-    }
-  }
-  return files;
-}
-
 function pluginMarketplaceFromManifest(manifestPath, cacheRoot) {
   const relative = path.relative(cacheRoot, manifestPath);
   const [marketplace] = relative.split(path.sep);
@@ -421,6 +416,10 @@ function skillSourceInfo(skillPath, home) {
       key: `plugin:${marketplace}:${pluginName}`,
       label: [marketplace, pluginName].filter(Boolean).join("/")
     };
+  }
+  const relativeUser = path.relative(path.join(os.homedir(), ".agents", "skills"), skillPath);
+  if (relativeUser && !relativeUser.startsWith("..") && !path.isAbsolute(relativeUser)) {
+    return { key: "user", label: "User" };
   }
   return { key: "unknown", label: "Unknown" };
 }
@@ -506,34 +505,55 @@ async function getPlugins() {
   };
 }
 
-async function getSkills() {
+async function getSkills(threadId, projectId = "") {
   const homeState = await refreshCodexHomeContext({ source: "skills" });
-  const roots = [path.join(homeState.home, "skills"), path.join(homeState.home, "plugins", "cache")];
-  const files = [];
-  for (const root of roots) files.push(...(await findSkillFiles(root)));
+  // Resolve the directory from known conversations, never a browser-supplied path.
+  const thread = threadId ? (await getThreads()).find((row) => row.id === threadId) : null;
+  if (threadId && !thread) {
+    const error = new Error("Thread is not available in the current account");
+    error.status = 404;
+    throw error;
+  }
+  const project = !threadId && projectId ? await resolveNewThreadProject(projectId) : null;
+  const cwd = threadId ? thread.cwd || "" : project?.rootPaths[0] || process.cwd();
+  const projectRoots = await projectSkillRoots(cwd);
+  let catalog;
+  try {
+    catalog = await readNativeSkills({ cli: CODEX_CLI, home: homeState.home, cwd });
+  } catch (error) {
+    const unavailable = new Error(`Cannot load Codex's enabled skill catalog: ${error.message}`);
+    unavailable.status = 503;
+    throw unavailable;
+  }
   const byUri = new Map();
-  for (const skillPath of files) {
+  for (const skill of catalog) {
     try {
-      const raw = await fs.readFile(skillPath, "utf8");
-      const fallbackName = path.basename(path.dirname(skillPath));
-      const metadata = parseSkillMetadata(raw, fallbackName);
-      if (!metadata.name) continue;
-      const source = skillSourceInfo(skillPath, homeState.home);
-      const uri = `skill://${encodeURIComponent(metadata.name)}@${encodeURIComponent(source.key)}`;
+      if (!path.isAbsolute(skill.path)) continue;
+      const skillFile = await fs.realpath(skill.path);
+      const uri = `skill://${encodeURIComponent(skillFile)}`;
+      if (byUri.has(uri)) continue;
+      const projectSkill = projectRoots.some((root) => skill.path.startsWith(root + path.sep));
+      const source = projectSkill
+        ? { key: "project", label: path.dirname(path.dirname(projectRoots.find((root) => skill.path.startsWith(root + path.sep)))) }
+        : skillSourceInfo(skill.path, homeState.home);
       byUri.set(uri, {
-        name: metadata.name,
-        displayName: metadata.name,
-        description: metadata.description,
+        name: skill.name,
+        displayName: skill.interface?.displayName || skill.name,
+        description: compactPluginDescription(skill.description || ""),
         source: source.label,
+        scope: source.key,
+        // Keep the catalog's exact path: resolving symlinks here can break native matching.
+        path: skill.path,
         uri
       });
     } catch {
-      // Ignore stale or partially installed skill entries.
+      // A skill removed after discovery is no longer selectable.
     }
   }
   const skills = [...byUri.values()].sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
   return {
     skills,
+    cwd,
     codexHome: homeState.home,
     codexHomeVersion: homeState.version
   };
@@ -547,8 +567,13 @@ function clearHomeScopedCaches() {
   threadsCache = null;
   threadsInFlight = null;
   messageCache.clear();
+  threadStatusReader.clear();
+  sessionMetadataReader.clear();
   recentNotices.splice(0, recentNotices.length);
   codexIpcClient?.clearHomeScopedState?.();
+  for (const client of appServerClients.values()) void client.close().catch(() => {});
+  appServerClients.clear();
+  appServerThreadIds.clear();
 }
 
 function normalizeCandidateHome(value) {
@@ -964,7 +989,7 @@ class DesktopCodexIpcClient {
       updatedAtMs: Math.max(existing.updatedAtMs || 0, timestampMs),
       archived: false,
       preview: existing.preview || "",
-      cwd: existing.cwd || "",
+      cwd: firstString(message?.params?.conversationState?.cwd, message?.params?.cwd, existing.cwd),
       model: existing.model || "",
       threadSource: message?.params?.conversationState?.threadSource ?? message?.params?.conversationState?.source ?? existing.threadSource,
       source: "desktop-ipc"
@@ -1214,17 +1239,19 @@ class DesktopCodexIpcClient {
     });
   }
 
-  async startTurn(threadId, text, images = []) {
+  async startTurn(threadId, text, images = [], settings = {}) {
     await this.ensureReady();
-    const input = [];
-    if (text) input.push({ type: "text", text, text_elements: [] });
-    for (const image of images) {
-      input.push({
-        type: "image",
-        url: `data:${image.mimeType};base64,${image.data}`
+    const input = desktopUserInput(text, images);
+    if (Object.keys(settings).length && (this.protocol.versions["thread-follower-start-turn"] ?? 1) >= 2) {
+      if (this.protocol.versions["thread-follower-update-thread-settings"] == null) {
+        throw Object.assign(new Error("This Desktop version cannot update model settings."), { status: 409 });
+      }
+      const updated = await this.request("thread-follower-update-thread-settings", {
+        hostId: "local", conversationId: threadId, threadSettings: settings
       });
+      if (updated.result?.applied !== true) throw Object.assign(new Error("Model settings were not applied. No message was sent."), { status: 409 });
     }
-    return this.request("thread-follower-start-turn", desktopStartTurnParams(this.protocol, threadId, input, randomUUID()));
+    return this.request("thread-follower-start-turn", desktopStartTurnParams(this.protocol, threadId, input, randomUUID(), settings));
   }
 
   async findThreadOwner(threadId) {
@@ -1237,6 +1264,14 @@ class DesktopCodexIpcClient {
     return this.request("thread-follower-interrupt-turn", {
       conversationId: threadId
     });
+  }
+
+  notifyThreadAvailable(threadId) {
+    if (!this.socket?.writable) return false;
+    const message = desktopThreadAvailableBroadcast(this.protocol, threadId, this.clientId);
+    if (!message) return false;
+    this.socket.write(this.encode(message));
+    return true;
   }
 
   async refreshRecentConversations(hostId = "local") {
@@ -1257,24 +1292,19 @@ class DesktopCodexIpcClient {
     );
   }
 
-  async startConversation(text, images = []) {
+  async startConversation(text, images = [], project = null, settings = {}) {
     await this.ensureReady();
-    const input = [];
-    if (text) input.push({ type: "text", text, text_elements: [] });
-    for (const image of images) {
-      input.push({
-        type: "image",
-        url: `data:${image.mimeType};base64,${image.data}`
-      });
-    }
+    const input = desktopUserInput(text, images);
     return this.request(
       "start-conversation",
       {
         hostId: "local",
         input,
         attachments: [],
-        cwd: process.cwd(),
-        workspaceRoots: [process.cwd()],
+        cwd: project?.rootPaths[0] || process.cwd(),
+        workspaceRoots: project?.rootPaths || [process.cwd()],
+        ...(project && !project.id.startsWith("root:") ? { projectAssignment: { projectKind: "local", projectId: project.id } } : {}),
+        ...settings,
         collaborationMode: null,
         threadSource: "user",
         approvalsReviewer: "user"
@@ -1660,7 +1690,7 @@ async function readSessionIndexRows() {
         updatedAtMs: Date.parse(row.updated_at),
         archived: false,
         preview: "",
-        cwd: "",
+        cwd: typeof row.cwd === "string" ? row.cwd : "",
         model: "",
         threadSource: row.thread_source ?? row.source,
         source: "session-index"
@@ -1731,6 +1761,72 @@ async function getAccountInfo() {
   return accountInfoInFlight;
 }
 
+async function getProjectContext() {
+  const { home, stateDb } = codexPaths((await refreshCodexHomeContext()).home);
+  let globalState = {};
+  try {
+    globalState = JSON.parse(await fs.readFile(path.join(home, ".codex-global-state.json"), "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+  }
+  let projects = [];
+  let databaseAvailable = false;
+  let roots = [];
+  let memberships = new Map();
+  if (existsSync(stateDb)) {
+    const tables = await runSqlJsonFromDb(stateDb, "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('projects', 'project_roots');");
+    if (tables.some((row) => row.name === "projects")) {
+      databaseAvailable = true;
+      projects = await runSqlJsonFromDb(stateDb, "SELECT id, name FROM projects ORDER BY position, id;");
+      if (tables.some((row) => row.name === "project_roots")) roots = await runSqlJsonFromDb(stateDb, "SELECT project_id, path FROM project_roots ORDER BY position;");
+    }
+    const columns = await runSqlJsonFromDb(stateDb, "PRAGMA table_info(threads);");
+    if (columns.some((row) => row.name === "project_id")) {
+      const rows = await runSqlJsonFromDb(stateDb, "SELECT id, project_id FROM threads;");
+      memberships = new Map(rows.map((row) => [row.id, row.project_id]));
+    }
+  }
+  // Migration keys are scoped to a Desktop host and Codex home.
+  globalState["app-server-project-id-by-legacy-project-id-by-host"] = {
+    [`local:${home}`]: globalState["app-server-project-id-by-legacy-project-id-by-host"]?.[`local:${home}`] || {}
+  };
+  return { ...projectCatalog(globalState, projects, roots, { databaseAvailable }), memberships, home };
+}
+
+async function resolveNewThreadProject(projectId) {
+  const context = await getProjectContext();
+  const project = context.projects.find((item) => item.id === projectId && item.rootPaths.length);
+  if (!project) {
+    const error = new Error("The selected local project is no longer available. Refresh the project list.");
+    error.status = 400;
+    throw error;
+  }
+  for (const root of project.rootPaths) {
+    if (!(await fs.stat(root).catch(() => null))?.isDirectory()) {
+      const error = new Error("The selected project's directory is unavailable.");
+      error.status = 409;
+      throw error;
+    }
+  }
+  return { ...project, codexHome: context.home };
+}
+
+async function addThreadStatuses(page) {
+  let index = 0;
+  // Bound I/O concurrency and inspect only the requested page after filtering.
+  await Promise.all(Array.from({ length: Math.min(6, page.threads.length) }, async () => {
+    while (index < page.threads.length) {
+      const thread = page.threads[index++];
+      try {
+        thread.status = await threadStatusReader.read(resolveRolloutPath(thread.rolloutPath));
+      } catch {
+        thread.status = { running: null };
+      }
+    }
+  }));
+  return page;
+}
+
 async function getThreads({ preserveIds = [] } = {}) {
   const preserveKey = [...new Set(preserveIds.map((id) => String(id || "").trim()).filter(Boolean))].sort().join(",");
   const now = Date.now();
@@ -1746,6 +1842,23 @@ async function getThreads({ preserveIds = [] } = {}) {
   }
 }
 
+async function hydrateThreadSources(rows) {
+  let index = 0;
+  await Promise.all(Array.from({ length: Math.min(6, rows.length) }, async () => {
+    while (index < rows.length) {
+      const row = rows[index++];
+      if (row.threadSource != null || (row.source && !["session-index", "desktop-ipc"].includes(row.source))) continue;
+      try {
+        const meta = await sessionMetadataReader.read(resolveRolloutPath(row.rolloutPath));
+        if (meta.source != null) row.threadSource = meta.source;
+      } catch {
+        // An unavailable or out-of-home rollout cannot supply source metadata.
+      }
+    }
+  }));
+  return rows.filter((row) => !isGuardianThread(row));
+}
+
 async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) {
   const loadStartedAt = Date.now();
   const timings = [];
@@ -1758,7 +1871,7 @@ async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) 
       ...rows,
       ...recentRows.filter((row) => {
         const id = String(row.id || "");
-        return !isArchivedThread(row) && !isGuardianThread(row) && !excludedIds.has(id) && !seen.has(id) && row.rolloutPath;
+        return (!isArchivedThread(row) || subagentInfo(row).isSubagent) && !isGuardianThread(row) && !excludedIds.has(id) && !seen.has(id) && row.rolloutPath;
       })
     ].sort((a, b) => {
       const updatedA = Number(a.updatedAtMs) || 0;
@@ -1777,8 +1890,7 @@ async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) 
         SELECT id, title, rollout_path AS rolloutPath, created_at_ms AS createdAtMs,
                updated_at_ms AS updatedAtMs, archived, preview, cwd, model, source AS threadSource
         FROM threads
-        ORDER BY updated_at_ms DESC, updated_at DESC
-        LIMIT 500;
+        ORDER BY updated_at_ms DESC, updated_at DESC;
       `);
       // Include older internal threads so the index and IPC cannot re-add them.
       const guardianRows = await runSqlJson(`
@@ -1792,10 +1904,10 @@ async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) 
       const filtered = await filterRowsForCurrentAccount(rows, (row) => row.id, preserveIds);
       markTiming("accountFilterState", stageStartedAt);
       const excludedIds = new Set([
-        ...rows.filter((row) => isArchivedThread(row) || isGuardianThread(row)).map((row) => String(row.id || "")),
+        ...rows.filter((row) => (isArchivedThread(row) && !subagentInfo(row).isSubagent) || isGuardianThread(row)).map((row) => String(row.id || "")),
         ...guardianRows.map((row) => String(row.id || ""))
       ]);
-      const stateRows = filtered.rows.filter((row) => !isArchivedThread(row) && !isGuardianThread(row)).map((row) => ({
+      const stateRows = filtered.rows.filter((row) => (!isArchivedThread(row) || subagentInfo(row).isSubagent) && !isGuardianThread(row)).map((row) => ({
         id: row.id,
         title: displayThreadTitle(row, sessionIndexTitles),
         rolloutPath: row.rolloutPath,
@@ -1804,7 +1916,8 @@ async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) 
         archived: Boolean(row.archived),
         preview: row.preview || "",
         cwd: row.cwd || "",
-        model: row.model || ""
+        model: row.model || "",
+        threadSource: row.threadSource
       }));
       const seen = new Set(stateRows.map((row) => String(row.id || "")));
       stageStartedAt = Date.now();
@@ -1828,6 +1941,7 @@ async function loadThreadsUncached({ preserveIds = [], preserveKey = "" } = {}) 
       value = appendRecentIpcRows(filtered.rows.filter((row) => !isGuardianThread(row)));
       markTiming("appendIpc", stageStartedAt);
     }
+    value = await hydrateThreadSources(value);
     const elapsedMs = Date.now() - loadStartedAt;
     if (elapsedMs > SLOW_POLL_REQUEST_MS) {
       logInfo(`[threads:slow] loadThreadsUncached ${elapsedMs}ms rows=${value.length} ${timings.join(" ")}`);
@@ -1849,7 +1963,7 @@ async function findThread(id) {
     null;
   const sessionIndexTitles = await readSessionIndexTitleMap();
   const rows = await runSqlJson(`
-    SELECT id, title, rollout_path AS rolloutPath, updated_at_ms AS updatedAtMs
+    SELECT id, title, rollout_path AS rolloutPath, updated_at_ms AS updatedAtMs, cwd
     FROM threads
     WHERE id = '${sqlString(id)}'
     LIMIT 1;
@@ -2255,8 +2369,8 @@ function interactionDedupeKey(message) {
 }
 
 function preferredInteractionMessage(existing, candidate) {
-  const existingIsLive = existing?.source === "desktop-ipc";
-  const candidateIsLive = candidate?.source === "desktop-ipc";
+  const existingIsLive = ["desktop-ipc", "app-server"].includes(existing?.source);
+  const candidateIsLive = ["desktop-ipc", "app-server"].includes(candidate?.source);
   const display = String(candidate?.content || "").length < String(existing?.content || "").length ? candidate : existing;
   const live = candidateIsLive ? candidate : existingIsLive ? existing : null;
   if (!live) return display;
@@ -2293,7 +2407,11 @@ function dedupeInteractionMessages(messages) {
 }
 
 function messageSortCompare(a, b) {
-  if (a.timestamp && b.timestamp) return String(a.timestamp).localeCompare(String(b.timestamp));
+  if (a.timestamp && b.timestamp) {
+    const time = String(a.timestamp).localeCompare(String(b.timestamp));
+    if (time) return time;
+  }
+  if (Number.isSafeInteger(a.sourceOffset) && Number.isSafeInteger(b.sourceOffset)) return a.sourceOffset - b.sourceOffset;
   return (a.lineNumber || 0) - (b.lineNumber || 0);
 }
 
@@ -2338,29 +2456,32 @@ function clientMessageKey(message) {
     .join(":");
 }
 
-function limitMessagesForClient(messages, status = {}, limit = DEFAULT_MESSAGE_LIMIT) {
+function limitMessagesForClient(messages, status = {}, limit = DEFAULT_MESSAGE_LIMIT, historyStart = 0) {
   const normalizedLimit = normalizeMessageLimit(limit);
-  const sorted = Array.isArray(messages) ? messages.slice().sort(messageSortCompare) : [];
-  const recentLowPriorityKeys = new Set(sorted.slice(-10).filter(isLowPriorityHiddenByDefaultMessage).map(clientMessageKey));
-  const visiblePriorityMessages = sorted.filter((message) => !isLowPriorityHiddenByDefaultMessage(message) || recentLowPriorityKeys.has(clientMessageKey(message)));
-  if (visiblePriorityMessages.length <= normalizedLimit) {
-    return {
-      messages: visiblePriorityMessages,
-      totalMessages: sorted.length,
-      truncated: visiblePriorityMessages.length !== sorted.length,
-      limit: normalizedLimit,
-      omittedMessages: Math.max(0, sorted.length - visiblePriorityMessages.length)
-    };
-  }
-  const tail = visiblePriorityMessages.slice(-normalizedLimit);
-  const includedKeys = new Set(tail.map(clientMessageKey));
-  const pinned = visiblePriorityMessages.filter((message) => shouldAlwaysReturnMessage(message, status) && !includedKeys.has(clientMessageKey(message)));
-  const limited = [...pinned, ...tail].sort(messageSortCompare);
+  // Tool calls and outputs never enter the response, including legacy cached data.
+  const sorted = (Array.isArray(messages) ? messages : [])
+    .filter((message) => ["user", "assistant", "interaction", "notice"].includes(message?.role))
+    .slice().sort(messageSortCompare);
+  const chat = sorted.filter((message) => message.role === "user" || message.role === "assistant");
+  const tail = chat.slice(-normalizedLimit);
+  const start = chat.length > normalizedLimit ? sorted.indexOf(tail[0]) : 0;
+  const lowPriority = sorted.slice(start).filter(isLowPriorityHiddenByDefaultMessage).slice(-10);
+  const recentLowPriorityKeys = new Set(lowPriority.map(clientMessageKey));
+  const limited = sorted.filter((message, index) => {
+    if (shouldAlwaysReturnMessage(message, status)) return true;
+    if (index < start) return false;
+    return !isLowPriorityHiddenByDefaultMessage(message) || recentLowPriorityKeys.has(clientMessageKey(message));
+  });
+  const offsets = tail.map((message) => message.sourceOffset).filter(Number.isSafeInteger);
+  const cursor = chat.length > normalizedLimit && offsets.length ? Math.min(...offsets) : historyStart;
   return {
     messages: limited,
+    hasMore: cursor > 0,
+    nextBefore: cursor > 0 ? cursor : null,
     totalMessages: sorted.length,
-    truncated: true,
+    truncated: limited.length !== sorted.length,
     limit: normalizedLimit,
+    limitUnit: "chat",
     omittedMessages: Math.max(0, sorted.length - limited.length)
   };
 }
@@ -2466,6 +2587,7 @@ function noticeContent(payload) {
 }
 
 function messageFromNoticeEvent(timestamp, payload, meta = {}) {
+  if (/(?:^|_)(?:call|call_output)$/.test(String(payload?.type || ""))) return null;
   if (!isNoticePayload(payload)) return null;
   const severity = noticeSeverity(payload);
   return {
@@ -2510,9 +2632,19 @@ function messageFromEvent(timestamp, payload, meta = {}) {
       kind: "message",
       timestamp,
       ...meta,
-      content: stripCodexDirectives(payload.message),
+      content: stripCodexDirectives(stripInjectedUserContext(payload.message)),
       images: Array.isArray(payload.images) ? payload.images : [],
       localImages: Array.isArray(payload.local_images) ? payload.local_images : []
+    };
+  }
+  if (payload?.type === "agent_reasoning") {
+    return {
+      role: "assistant",
+      kind: "reasoning",
+      phase: "analysis",
+      timestamp,
+      ...meta,
+      content: stripCodexDirectives(payload.text || payload.message)
     };
   }
   if (payload?.type === "agent_message") {
@@ -2529,32 +2661,22 @@ function messageFromEvent(timestamp, payload, meta = {}) {
 }
 
 function messageFromResponseItem(timestamp, payload) {
-  if (payload?.type === "function_call") {
-    return {
-      role: "tool",
-      kind: "tool_call",
-      timestamp,
-      title: payload.name || "function_call",
-      content: compact(payload.arguments || "")
-    };
-  }
-  if (payload?.type === "function_call_output") {
-    const images = imagesFromToolOutput(payload.output);
-    return {
-      role: "tool",
-      kind: "tool_output",
-      timestamp,
-      title: payload.call_id || "function_call_output",
-      content: compactToolOutput(payload.output || "", images),
-      images
-    };
+  if (payload?.type === "reasoning") {
+    const summary = Array.isArray(payload.summary)
+      ? payload.summary.filter((part) => part?.type === "summary_text").map((part) => part.text || "").join("\n\n")
+      : "";
+    return { role: "assistant", kind: "reasoning", phase: "analysis", timestamp, content: stripCodexDirectives(summary) };
   }
   if (payload?.type === "message") {
+    if (payload.role !== "user" && payload.role !== "assistant") return null;
     return {
-      role: payload.role || "assistant",
+      role: payload.role,
       kind: "message",
+      phase: payload.phase || "",
       timestamp,
-      content: stripCodexDirectives(textFromContent(payload.content)),
+      content: stripCodexDirectives(payload.role === "user"
+        ? stripInjectedUserContext(textFromContent(payload.content))
+        : textFromContent(payload.content)),
       images: imagesFromContent(payload.content)
     };
   }
@@ -2573,7 +2695,8 @@ function createRolloutParseState(stat, nowMs) {
   return {
     eventMessages: [],
     fallbackMessages: [],
-    toolMessages: [],
+    reasoningEvents: [],
+    reasoningFallbacks: [],
     interactionMessages: [],
     noticeMessages: [],
     meta: {},
@@ -2585,11 +2708,11 @@ function createRolloutParseState(stat, nowMs) {
   };
 }
 
-function parseRolloutLine(line, state) {
+function parseRolloutLine(line, state, sourceOffset) {
   state.lineNumber += 1;
-  if (!line.trim()) return;
+  if (typeof line === "string" && !line.trim()) return;
   try {
-    const entry = JSON.parse(line);
+    const entry = typeof line === "string" ? JSON.parse(line) : line;
     const entryAtMs = Date.parse(entry.timestamp);
     if (Number.isFinite(entryAtMs)) state.lastEntryAtMs = entryAtMs;
     if (entry.type === "session_meta") {
@@ -2625,18 +2748,19 @@ function parseRolloutLine(line, state) {
       };
       const interaction = messageFromInteractionEvent(entry.timestamp, entry.payload, messageMeta);
       if (hasDisplayableMessageContent(interaction)) {
-        state.interactionMessages.push({ ...interaction, lineNumber: state.lineNumber });
+        state.interactionMessages.push({ ...interaction, lineNumber: state.lineNumber, sourceOffset });
         return;
       }
       const notice = messageFromNoticeEvent(entry.timestamp, entry.payload, messageMeta);
       if (hasDisplayableMessageContent(notice)) {
-        state.noticeMessages.push({ ...notice, lineNumber: state.lineNumber });
+        state.noticeMessages.push({ ...notice, lineNumber: state.lineNumber, sourceOffset });
         return;
       }
       const msg = messageFromEvent(entry.timestamp, entry.payload, messageMeta);
       if (hasDisplayableMessageContent(msg)) {
-        const message = { ...msg, lineNumber: state.lineNumber };
-        state.eventMessages.push(message);
+        const message = { ...msg, lineNumber: state.lineNumber, sourceOffset };
+        if (message.kind === "reasoning") state.reasoningEvents.push(message);
+        else state.eventMessages.push(message);
         if (message.role === "assistant" && message.turnId) state.assistantMessagesByTurn.set(message.turnId, message);
       }
       return;
@@ -2648,32 +2772,35 @@ function parseRolloutLine(line, state) {
       };
       const interaction = messageFromInteractionEvent(entry.timestamp, entry.payload, messageMeta);
       if (hasDisplayableMessageContent(interaction)) {
-        state.interactionMessages.push({ ...interaction, lineNumber: state.lineNumber });
+        state.interactionMessages.push({ ...interaction, lineNumber: state.lineNumber, sourceOffset });
         return;
       }
+      if (/(?:^|_)(?:call|call_output)$/.test(String(entry.payload?.type || ""))) return;
       const notice = messageFromNoticeEvent(entry.timestamp, entry.payload);
       if (hasDisplayableMessageContent(notice)) {
-        state.noticeMessages.push({ ...notice, lineNumber: state.lineNumber });
+        state.noticeMessages.push({ ...notice, lineNumber: state.lineNumber, sourceOffset });
         return;
       }
       const msg = messageFromResponseItem(entry.timestamp, entry.payload);
       if (!hasDisplayableMessageContent(msg)) return;
-      if (msg.role === "tool") state.toolMessages.push({ ...msg, lineNumber: state.lineNumber });
-      else state.fallbackMessages.push({ ...msg, lineNumber: state.lineNumber });
+      if (msg.kind === "reasoning") state.reasoningFallbacks.push({ ...msg, lineNumber: state.lineNumber, sourceOffset });
+      else state.fallbackMessages.push({ ...msg, lineNumber: state.lineNumber, sourceOffset });
     }
   } catch {
     state.fallbackMessages.push({
       role: "system",
       kind: "parse_error",
       timestamp: null,
-      lineNumber: state.lineNumber,
+      lineNumber: state.lineNumber, sourceOffset,
       content: `Could not parse JSONL line ${state.lineNumber}`
     });
   }
 }
 
 function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false }) {
-  const chatMessages = state.eventMessages.length ? state.eventMessages : state.fallbackMessages;
+  const chatSource = state.eventMessages.length || state.preferredChatSource === "event" ? "event" : "response";
+  const chatMessages = (chatSource === "event" ? state.eventMessages : state.fallbackMessages)
+    .filter((message) => message.role === "user" || message.role === "assistant");
   if (partial) {
     const recentOpenTurn = [...state.openTurns.values()].at(-1) || null;
     const fileRecentlyUpdated = nowMs - Math.max(state.lastEntryAtMs || 0, stat.mtimeMs || 0) < ACTIVE_STATUS_CACHE_MS * 2;
@@ -2687,9 +2814,11 @@ function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false 
   for (const message of state.interactionMessages) {
     message.requiresDesktopAction = Boolean(visibleActiveTurn && (!message.turnId || message.turnId === visibleActiveTurn.turnId));
   }
+  const reasoningMessages = state.reasoningEvents.length ? state.reasoningEvents : state.reasoningFallbacks;
   const pendingInteractions = state.interactionMessages.filter((message) => message.requiresDesktopAction);
   const activeTurnWaitMs = visibleActiveTurn?.startedAtMs ? nowMs - visibleActiveTurn.startedAtMs : 0;
   return {
+    chatSource,
     meta: state.meta,
     file: filePath,
     size: stat.size,
@@ -2705,44 +2834,63 @@ function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false 
       staleTurnId: activeTurnStale ? state.activeTurn?.turnId || null : null,
       staleTurnLastUpdatedAtMs: activeTurnStale ? activeTurnLastUpdatedAtMs : null
     },
-    messages: dedupeInteractionMessages([...chatMessages, ...pendingInteractions, ...state.noticeMessages, ...state.toolMessages]).sort(messageSortCompare)
+    messages: dedupeInteractionMessages([...chatMessages, ...reasoningMessages, ...pendingInteractions, ...state.noticeMessages]).sort(messageSortCompare)
   };
 }
 
-async function readRolloutTailLines(filePath, stat, limit) {
-  const bytes = Math.min(TAIL_ROLLOUT_MAX_BYTES, Math.max(TAIL_ROLLOUT_MIN_BYTES, normalizeMessageLimit(limit) * 24 * 1024));
-  const start = Math.max(0, stat.size - bytes);
-  const handle = await fs.open(filePath, "r");
+function mapRolloutHistoryLine(line) {
   try {
-    const buffer = Buffer.alloc(stat.size - start);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, start);
-    let text = buffer.subarray(0, bytesRead).toString("utf8");
-    if (start > 0) {
-      const firstNewline = text.indexOf("\n");
-      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+    const entry = JSON.parse(line);
+    const payload = entry.payload;
+    if (entry.type === "session_meta") return entry;
+    if (!payload || typeof payload !== "object") return null;
+    if (entry.type === "response_item" && payload.type === "reasoning") {
+      // Never retain encrypted reasoning while scanning older byte windows.
+      return { type: entry.type, timestamp: entry.timestamp, payload: { type: "reasoning", summary: payload.summary } };
     }
-    return text.split(/\r?\n/).filter((line) => line.trim());
-  } finally {
-    await handle.close();
+    if (entry.type === "response_item" && payload.type === "message") return entry;
+    if (entry.type === "event_msg" && ["user_message", "agent_message", "agent_reasoning", "task_started", "task_complete", "turn_aborted"].includes(payload.type)) return entry;
+    if (!["event_msg", "response_item"].includes(entry.type)) return null;
+    if (isInteractionPayload(payload)) return entry;
+    if (messageFromNoticeEvent(entry.timestamp, payload)) return entry;
+    return null;
+  } catch {
+    return null;
   }
 }
 
-async function parseRolloutTail(filePath, stat, limit, nowMs) {
-  const state = createRolloutParseState(stat, nowMs);
-  const lines = await readRolloutTailLines(filePath, stat, limit);
-  for (const line of lines) parseRolloutLine(line, state);
-  return rolloutResultFromState({ filePath, stat, nowMs, state, partial: true });
+async function parseRolloutTail(filePath, stat, limit, nowMs, before = null) {
+  const normalizedLimit = normalizeMessageLimit(limit);
+  const maxBytes = Math.min(TAIL_ROLLOUT_MAX_BYTES, Math.max(TAIL_ROLLOUT_MIN_BYTES, normalizeMessageLimit(limit) * 24 * 1024));
+  let entries = [];
+  let cursor = before;
+  let window;
+  let result;
+  do {
+    window = await readRolloutWindow(filePath, { before: cursor, size: stat.size, maxBytes, mapLine: mapRolloutHistoryLine });
+    entries = window.entries.concat(entries);
+    const state = createRolloutParseState(stat, nowMs);
+    if (before != null) state.preferredChatSource = messageCache.get(filePath)?.result?.chatSource;
+    for (const { line, offset } of entries) parseRolloutLine(line, state, offset);
+    result = rolloutResultFromState({ filePath, stat, nowMs, state, partial: window.startOffset > 0 });
+    cursor = window.startOffset;
+  } while (cursor > 0 && result.messages.filter((message) => message.role === "user" || message.role === "assistant").length < normalizedLimit);
+  return {
+    ...result,
+    historyStart: window.startOffset,
+    historyFileId: `${stat.dev}:${stat.ino}`
+  };
 }
 
 async function parseRollout(filePath, { limit = DEFAULT_MESSAGE_LIMIT, preferTail = false } = {}) {
   const stat = await fs.stat(filePath);
-  const signature = `${stat.size}:${stat.mtimeMs}:${preferTail ? normalizeMessageLimit(limit) : "full"}`;
+  const signature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${preferTail ? normalizeMessageLimit(limit) : "full"}`;
   const cached = messageCache.get(filePath);
   const nowMs = Date.now();
   const cachedAgeMs = nowMs - (cached?.cachedAtMs || 0);
   if (cached?.signature === signature && (!cached.result?.status?.thinking || cachedAgeMs < ACTIVE_STATUS_CACHE_MS)) return cached.result;
 
-  if (preferTail && stat.size > TAIL_ROLLOUT_MAX_BYTES) {
+  if (preferTail) {
     const result = await parseRolloutTail(filePath, stat, limit, nowMs);
     messageCache.set(filePath, { signature, result, cachedAtMs: nowMs });
     return result;
@@ -2762,7 +2910,7 @@ async function parseRollout(filePath, { limit = DEFAULT_MESSAGE_LIMIT, preferTai
   return result;
 }
 
-async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT } = {}) {
+async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } = {}) {
   keepIpcWarm();
   const thread = await findThread(id);
   if (!thread) {
@@ -2770,7 +2918,26 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT } = {}) {
     err.status = 404;
     throw err;
   }
-  const ipcInteractions = codexIpcClient?.getRecentInteractionMessages(id) || [];
+  if (before == null) {
+    const home = codexPaths().home;
+    const rows = await getThreads({ preserveIds: [id] });
+    if (codexPaths().home !== home) {
+      const error = new Error("Codex home changed; refresh the conversation.");
+      error.status = 409;
+      throw error;
+    }
+    const catalogThread = rows.find((row) => row.id === id);
+    if (catalogThread) {
+      const info = subagentInfo(catalogThread);
+      const child = info.isSubagent ? childThreads([catalogThread], info.parentId)[0] : null;
+      Object.assign(thread, { title: child?.title || thread.title,
+        parentId: info.parentId, isSubagent: info.isSubagent });
+    }
+    thread.subagents = (await addThreadStatuses({ threads: childThreads(rows, id) })).threads;
+  }
+  const localInteractions = (appServerClients.get(id)?.pendingApprovals(id) || []).map((request, index) =>
+    messageFromInteractionEvent(request.timestamp, { ...request, requestId: String(request.id) }, { source: "app-server", lineNumber: 1200000 + index })).filter(Boolean);
+  const ipcInteractions = [...(codexIpcClient?.getRecentInteractionMessages(id) || []), ...localInteractions];
   const ipcNotices = codexIpcClient?.getRecentNoticeMessages(id) || [];
   const serverNotices = getRecentNoticeMessages(id);
   const liveMessages = [...ipcInteractions, ...ipcNotices, ...serverNotices];
@@ -2794,9 +2961,16 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT } = {}) {
       ...limited
     };
   }
+  if (before != null) {
+    const stat = await fs.stat(rolloutPath);
+    const parsed = await parseRolloutTail(rolloutPath, stat, limit, Date.now(), before);
+    // Historical approvals are not actionable; only the current poll supplies them.
+    const messages = parsed.messages.filter((message) => message.role !== "interaction");
+    return { thread, ...parsed, ...limitMessagesForClient(messages, {}, limit, parsed.historyStart) };
+  }
   const parsed = await parseRollout(rolloutPath, { limit, preferTail: true });
   if (!liveMessages.length) {
-    const limited = limitMessagesForClient(parsed.messages, parsed.status, limit);
+    const limited = limitMessagesForClient(parsed.messages, parsed.status, limit, parsed.historyStart);
     return { thread, ...parsed, ...limited };
   }
   const status = {
@@ -2804,7 +2978,7 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT } = {}) {
     interactionRequired: parsed.status?.interactionRequired || ipcInteractions.some((message) => message.requiresDesktopAction)
   };
   const messages = dedupeInteractionMessages([...parsed.messages, ...liveMessages]).sort(messageSortCompare);
-  const limited = limitMessagesForClient(messages, status, limit);
+  const limited = limitMessagesForClient(messages, status, limit, parsed.historyStart);
   return {
     thread,
     ...parsed,
@@ -2951,7 +3125,45 @@ function webpDimensions(bytes) {
   return null;
 }
 
-async function sendToCodex(text, threadId, images = [], { newThread = false } = {}) {
+let modelCatalogCache = null;
+async function getModels(threadId = "") {
+  const { home } = await refreshCodexHomeContext({ source: "models" });
+  if (!modelCatalogCache || modelCatalogCache.home !== home || Date.now() - modelCatalogCache.at > 60000) {
+    const models = await readModelCatalog({ cli: CODEX_CLI, home, cwd: home });
+    if (codexPaths().home !== home) throw Object.assign(new Error("Codex home changed; refresh the model list."), { status: 409 });
+    modelCatalogCache = { home, at: Date.now(), models };
+  }
+  const models = modelCatalogCache.models;
+  let settings = {};
+  if (threadId) {
+    const thread = await findThread(threadId);
+    if (!thread) throw Object.assign(new Error("Thread not found"), { status: 404 });
+    settings = { model: thread.model || null };
+    try {
+      settings = mergeModelSettings(settings, await readRolloutModelSettings(resolveRolloutPath(thread.rolloutPath)));
+    } catch {
+      // Missing or unreadable rollouts do not prevent catalog discovery.
+    }
+    try {
+      const client = getCodexIpcClient();
+      await client.ensureReady();
+      if (client.protocol.versions["thread-follower-read-model-settings"] != null) {
+        const result = await client.request("thread-follower-read-model-settings", { hostId: "local", conversationId: threadId }, { timeoutMs: 3000 });
+        if (result.result?.settings) {
+          settings = mergeModelSettings(settings, result.result.settings);
+        }
+      }
+    } catch {
+      // A background conversation may have no Desktop owner; retain known metadata.
+    }
+  }
+  if ((await refreshCodexHomeContext({ source: "models" })).home !== home) {
+    throw Object.assign(new Error("Codex home changed; refresh the model list."), { status: 409 });
+  }
+  return { models, settings };
+}
+
+async function sendToCodex(text, threadId, images = [], { newThread = false, projectId = "", model, effort } = {}) {
   await refreshCodexHomeContext({ source: "send" });
   if (!ALLOW_WRITE) {
     const err = new Error("Read-only mode is enabled. Restart without --readonly to send messages to Codex Desktop.");
@@ -2970,16 +3182,22 @@ async function sendToCodex(text, threadId, images = [], { newThread = false } = 
     err.status = 400;
     throw err;
   }
+  if (desktopUserInput(trimmed).some((item) => item.type === "skill")) {
+    const skillThreadId = newThread ? null : threadId || (await getThreads())[0]?.id;
+    const catalog = await getSkills(skillThreadId, newThread ? projectId : "");
+    assertAvailableSkillReferences(trimmed, catalog.skills);
+  }
+  const settings = model != null || effort != null
+    ? validateModelSettings({ model, effort }, (await getModels()).models) : {};
   if (newThread) {
     if (normalizedImages.length) {
       const err = new Error("Starting a new Codex conversation with images from the web is not supported yet. Create the conversation with text first, then send images in the new thread.");
       err.status = 409;
       throw err;
     }
-    const result = await startNewCodexThread(trimmed);
-    if (result.threadId) {
-      await notifyCodexDesktopThreadCreated(result.threadId);
-    }
+    const project = projectId ? await resolveNewThreadProject(projectId) : null;
+    const result = await startNewCodexThread(trimmed, project, settings);
+    threadsCache = null;
     return {
       ok: true,
       mode: result.source || "desktop-ipc",
@@ -2998,15 +3216,38 @@ async function sendToCodex(text, threadId, images = [], { newThread = false } = 
     err.status = 400;
     throw err;
   }
-  if (!(await findThread(targetThreadId))) {
+  const targetThread = await findThread(targetThreadId);
+  if (!targetThread) {
     const err = new Error("Thread not found");
     err.status = 404;
     throw err;
   }
 
+  if (await isAppServerThread(targetThread)) {
+    const home = codexPaths().home;
+    const client = await getLocalAppServerClient(home, targetThreadId);
+    // Resuming sends no input. If Desktop already owns the thread, use its
+    // existing owner without opening or navigating a Desktop window.
+    try { await client.resumeThread(targetThreadId); } catch (error) {
+      await client.close();
+      if (!/writer|already.*(load|open|use)|locked/i.test(error.message || "")) throw error;
+      const response = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
+      return { ok: true, mode: "desktop-ipc", threadId: targetThreadId,
+        turnId: response?.result?.result?.turn?.id || null, sentAt: new Date().toISOString() };
+    }
+    if ((await refreshCodexHomeContext({ source: "send" })).home !== home) {
+      await client.close();
+      throw Object.assign(new Error("Codex home changed; refresh before sending."), { status: 409 });
+    }
+    const response = await client.startTurn(targetThreadId, desktopUserInput(trimmed, normalizedImages), settings);
+    return { ok: true, mode: "app-server", threadId: targetThreadId,
+      images: normalizedImages.map(({ name, mimeType, size }) => ({ name, mimeType, size })),
+      turnId: response.turn?.id || null, sentAt: new Date().toISOString() };
+  }
+
   let result;
   try {
-    result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages);
+    result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
   } catch (error) {
     const noticeMessage = error?.message || "Codex Desktop rejected the message.";
     if (isNoOpenOwnerError(error)) {
@@ -3015,7 +3256,7 @@ async function sendToCodex(text, threadId, images = [], { newThread = false } = 
         await openCodexUrl(`codex://threads/${encodeURIComponent(targetThreadId)}`);
         await getCodexIpcClient().waitForConversationEvent(targetThreadId, { sinceMs: openedAt, timeoutMs: 6000 });
         await sleep(500);
-        result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages);
+        result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
       } catch (retryError) {
         const retryMessage = retryError?.message ? ` Last IPC error: ${retryError.message}.` : "";
         const err = new Error(`Codex Desktop has no open owner for this thread. I tried opening the target conversation; wait for it to finish opening in Codex Desktop, then send again.${retryMessage}`);
@@ -3031,7 +3272,7 @@ async function sendToCodex(text, threadId, images = [], { newThread = false } = 
     } else if (isIpcTimeoutError(error)) {
       try {
         await sleep(750);
-        result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages);
+        result = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
       } catch (retryError) {
         const retryMessage = retryError?.message || noticeMessage;
         const err = new Error(`Codex Desktop did not respond to the send request in time. Check that the target conversation is open and try again. Last IPC error: ${retryMessage}`);
@@ -3075,122 +3316,137 @@ function turnIdFromStartConversation(response) {
   return firstString(result?.turn?.id, result?.turnId, result?.turn_id, response?.turnId, response?.turn_id);
 }
 
-async function startNewCodexThread(text) {
+async function getLocalAppServerClient(home = codexPaths().home, threadId = "") {
+  let client = appServerClients.get(threadId);
+  if (client?.closing) await client.exited;
+  if (!client || client.closed || client.failure) {
+    if (client) await client.close();
+    client = new AppServerThreadClient({
+      cli: CODEX_CLI, home, cwd: process.cwd(),
+      onNotice: (id, content) => {
+        if (codexPaths().home === home) recordNotice(id, { severity: "error", title: "Codex execution failed", content, source: "app-server" });
+      }
+    });
+    if (threadId) {
+      appServerClients.set(threadId, client);
+      const registered = client;
+      void client.exited.then(() => { if (appServerClients.get(threadId) === registered) appServerClients.delete(threadId); });
+    }
+  }
+  return client;
+}
+
+async function isAppServerThread(thread) {
+  if (appServerThreadIds.has(thread.id)) return true;
+  const filePath = resolveRolloutPath(thread.rolloutPath);
+  if (!filePath) return false;
+  let file;
   try {
-    const response = await getCodexIpcClient().startConversation(text);
+    file = await fs.open(filePath, "r");
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    const firstLine = buffer.subarray(0, bytesRead).toString("utf8").split("\n")[0];
+    const record = JSON.parse(firstLine);
+    if (record.type === "session_meta" && record.payload?.originator === "codex_lan_companion") {
+      appServerThreadIds.add(thread.id);
+      return true;
+    }
+  } catch {
+    // Missing or incompatible metadata keeps the existing Desktop route.
+  } finally {
+    await file?.close();
+  }
+  return false;
+}
+
+async function startNewCodexThread(text, project = null, settings = {}) {
+  const home = codexPaths().home;
+  if (project?.codexHome && project.codexHome !== home) {
+    const error = new Error("Codex home changed; refresh the project list before sending.");
+    error.status = 409;
+    throw error;
+  }
+  const client = getCodexIpcClient();
+  try {
+    await client.ensureReady();
+  } catch {
+    return startNewCodexThreadViaAppServer(text, project, home, settings);
+  }
+  // Modern Desktop has removed the legacy creation method. Do not wait for
+  // request discovery to time out when the installed protocol proves it absent.
+  if (client.protocol.detected && (client.protocol.versions["thread-follower-start-turn"] ?? 0) >= 2
+    && !Object.hasOwn(client.protocol.versions, "start-conversation")) {
+    return startNewCodexThreadViaAppServer(text, project, home, settings);
+  }
+  try {
+    const response = await client.startConversation(text, [], project, settings);
     const threadId = conversationIdFromStartConversation(response);
     if (!threadId) throw new Error(`Codex Desktop did not return a conversation id. ${compact(response, 1200)}`);
-    return {
-      threadId,
-      turnId: turnIdFromStartConversation(response),
-      source: "desktop-ipc"
-    };
+    return { threadId, turnId: turnIdFromStartConversation(response), source: "desktop-ipc" };
   } catch (error) {
-    const fallback = await startNewCodexThreadViaAppServer(text);
-    return {
-      ...fallback,
-      source: "app-server-fallback",
-      fallbackReason: error.message || String(error)
-    };
+    // A timeout can hide successful creation; never retry that request.
+    if (!/^(no-client-found|request-version-mismatch|method-not-found)$/.test(error.message || "")) throw error;
+    return startNewCodexThreadViaAppServer(text, project, home, settings);
   }
 }
 
-function startNewCodexThreadViaAppServer(text) {
-  return new Promise((resolve, reject) => {
-    const { home } = codexPaths();
-    const child = spawn(CODEX_CLI, ["debug", "app-server", "send-message-v2", text], {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        CODEX_HOME: home
-      },
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let threadId = "";
-    let turnId = "";
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      child.kill("SIGTERM");
-      const err = new Error("Timed out starting a new Codex conversation.");
-      err.status = 504;
-      reject(err);
-    }, 45000);
-
-    const maybeResolve = () => {
-      threadId ||= firstRegexGroup(stdout, /"thread"[\s\S]*?"id"\s*:\s*"([^"]+)"/);
-      turnId ||= firstRegexGroup(stdout, /"turn"[\s\S]*?"id"\s*:\s*"([^"]+)"/);
-      if (!settled && threadId && turnId) {
-        settled = true;
-        clearTimeout(timer);
-        resolve({ threadId, turnId });
-      }
-    };
-
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk.toString("utf8");
-      if (stdout.length > 2_000_000) stdout = stdout.slice(-1_000_000);
-      maybeResolve();
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk.toString("utf8");
-      if (stderr.length > 200_000) stderr = stderr.slice(-100_000);
-    });
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (settled) return;
-      maybeResolve();
-      if (settled) return;
-      const detail = firstString(stderr, stdout, `codex app-server exited with code ${code}`);
-      const err = new Error(`Failed to start a new Codex conversation. ${compact(detail, 1200)}`);
-      err.status = 502;
-      reject(err);
-    });
-  });
-}
-
-async function notifyCodexDesktopThreadCreated(threadId) {
-  const id = String(threadId || "").trim();
-  if (!id) return;
-  const client = getCodexIpcClient();
-  const failures = [];
+async function startNewCodexThreadViaAppServer(text, project = null, home = codexPaths().home, settings = {}) {
+  const startedAt = Date.now();
+  const assertHome = async () => {
+    if ((await refreshCodexHomeContext({ source: "new-thread" })).home !== home) {
+      const error = new Error("Codex home changed; refresh before sending. No message was sent.");
+      error.status = 409;
+      throw error;
+    }
+  };
+  let threadId = "";
+  let client;
   try {
-    await client.refreshRecentConversations("local");
-  } catch (error) {
-    failures.push(`refresh: ${error.message || error}`);
-  }
-  try {
-    await client.setActiveConversation(id, true, "local");
-  } catch (error) {
-    failures.push(`set active: ${error.message || error}`);
-  }
-  try {
-    await openCodexUrl(`codex://threads/${encodeURIComponent(id)}`);
-  } catch (error) {
-    failures.push(`open: ${error.message || error}`);
-  }
-  if (failures.length) {
-    recordNotice(id, {
-      severity: "warning",
-      title: "Desktop refresh delayed",
-      content: `The conversation was created, but Codex Desktop may need a moment to refresh.\n\n${failures.join("\n")}`,
-      source: "new-thread"
+    await assertHome();
+    client = await getLocalAppServerClient(home);
+    const created = await client.createThread({
+      cwd: project?.rootPaths[0] || process.cwd(),
+      workspaceRoots: project?.rootPaths || [process.cwd()],
+      projectId: project && !project.id.startsWith("root:") ? project.id : undefined,
+      title: text.split(/\r?\n/).find((line) => line.trim())?.trim().slice(0, 100) || "New conversation"
     });
+    threadId = created.threadId;
+    appServerClients.set(threadId, client);
+    const registered = client;
+    void client.exited.then(() => {
+      if (appServerClients.get(threadId) !== registered) return;
+      appServerClients.delete(threadId);
+      notifyDesktopThreadAvailable(threadId, home);
+    });
+    appServerThreadIds.add(threadId);
+    threadsCache = null;
+    notifyDesktopThreadAvailable(threadId, home);
+    const createdAt = Date.now();
+    await assertHome();
+    const response = await client.startTurn(threadId, desktopUserInput(text), settings);
+    logInfo(`[new-thread] app-server create=${createdAt - startedAt}ms submit=${Date.now() - createdAt}ms total=${Date.now() - startedAt}ms`);
+    return { threadId, turnId: response.turn?.id || null, source: "app-server" };
+  } catch (error) {
+    if (client && (error.status !== 504 || !threadId)) await client.close();
+    if (codexPaths().home === home && (threadId || error.threadId)) {
+      error.threadId = threadId || error.threadId;
+      error.status ||= 503;
+      error.message = `The conversation was created, but its first message could not be confirmed. Check its messages before sending again. ${error.message}`;
+    } else {
+      delete error.threadId;
+    }
+    throw error;
   }
 }
 
-function firstRegexGroup(text, regex) {
-  const match = String(text || "").match(regex);
-  return match?.[1] || "";
+function notifyDesktopThreadAvailable(threadId, home) {
+  if (codexPaths().home !== home) return;
+  try {
+    if (codexIpcClient?.notifyThreadAvailable(threadId)) logInfo("[desktop:list-refresh] Thread metadata notification sent.");
+  } catch {
+    // List notification is best effort and must never fail or delay a send.
+    logInfo("[desktop:list-refresh] Desktop list notification unavailable; waiting for its normal sync.");
+  }
 }
 
 async function openCodexUrl(url) {
@@ -3230,6 +3486,11 @@ async function interruptCodex(threadId) {
     throw err;
   }
 
+  const localClient = appServerClients.get(targetThreadId);
+  if (localClient?.active.has(targetThreadId)) {
+    await localClient.interrupt(targetThreadId);
+    return { ok: true, mode: "app-server", threadId: targetThreadId, interruptedAt: new Date().toISOString() };
+  }
   try {
     await getCodexIpcClient().interruptTurn(targetThreadId);
   } catch (error) {
@@ -3408,6 +3669,12 @@ async function respondToApproval({ threadId, requestId, decision, approvalKind }
     throw err;
   }
   const normalizedDecision = normalizeApprovalDecision(decision);
+  const localClient = appServerClients.get(targetThreadId);
+  if (localClient?.pendingApprovals(targetThreadId).some((request) => String(request.id) === String(requestId))) {
+    localClient.respondToApproval(targetThreadId, requestId, normalizedDecision);
+    return { ok: true, mode: "app-server", threadId: targetThreadId, requestId,
+      decision: normalizedDecision, approvalKind, decidedAt: new Date().toISOString() };
+  }
   const liveRequest = findLiveApprovalRequest(targetThreadId, requestId);
   const decisionCandidates = approvalDecisionCandidatesForRequest(decision, liveRequest);
   const resolvedRequestId = liveRequest?.requestId || String(requestId || "");
@@ -3595,7 +3862,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/send") {
       if (!requireAuthorized(req, res, url)) return;
       const body = await readJsonBody(req, MAX_SEND_BODY_BYTES);
-      sendJson(res, 200, await sendToCodex(body.message, body.threadId, body.images, { newThread: Boolean(body.newThread) }));
+      sendJson(res, 200, await sendToCodex(body.message, body.threadId, body.images, { newThread: Boolean(body.newThread), projectId: body.projectId, model: body.model, effort: body.effort }));
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/new-thread") {
@@ -3626,6 +3893,11 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ...(await getAccountInfo()), codexHome: homeState.home, codexHomeVersion: homeState.version });
       return;
     }
+    if (req.method === "GET" && url.pathname === "/api/models") {
+      if (!requireAuthorized(req, res, url)) return;
+      sendJson(res, 200, await getModels(url.searchParams.get("threadId") || ""));
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/api/plugins") {
       if (!requireAuthorized(req, res, url)) return;
       sendJson(res, 200, await getPlugins());
@@ -3633,23 +3905,40 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "GET" && url.pathname === "/api/skills") {
       if (!requireAuthorized(req, res, url)) return;
-      sendJson(res, 200, await getSkills());
+      sendJson(res, 200, await getSkills(url.searchParams.get("threadId"), url.searchParams.get("projectId")));
       return;
     }
     if (req.method === "GET" && url.pathname === "/api/threads") {
       if (!requireAuthorized(req, res, url)) return;
       const homeState = await refreshCodexHomeContext({ source: "threads" });
+      const rows = await getThreads({ preserveIds: [url.searchParams.get("selectedId")] });
+      const context = await getProjectContext();
+      const pageOptions = {
+        offset: url.searchParams.get("offset"), limit: url.searchParams.get("limit"),
+        query: url.searchParams.get("q"), projectId: url.searchParams.get("projectId"), selectedId: url.searchParams.get("selectedId")
+      };
+      const page = await addThreadStatuses(sidebarThreadPage(withThreadProjects(rows, context, context.memberships), pageOptions, threadPage));
+      const currentHome = await refreshCodexHomeContext();
+      const homeChanged = currentHome.version !== homeState.version;
       sendJson(res, 200, {
-        threads: await getThreads({ preserveIds: [url.searchParams.get("selectedId")] }),
-        codexHome: homeState.home,
-        codexHomeVersion: homeState.version
+        ...(homeChanged ? threadPage([], pageOptions) : page),
+        projects: homeChanged ? [] : context.projects,
+        codexHome: currentHome.home,
+        codexHomeVersion: currentHome.version
       });
       return;
     }
     const match = url.pathname.match(/^\/api\/threads\/([0-9a-fA-F-]{20,})\/messages$/);
     if (req.method === "GET" && match) {
       if (!requireAuthorized(req, res, url)) return;
-      sendJson(res, 200, await getMessages(match[1], { limit: url.searchParams.get("limit") }));
+      const homeState = await refreshCodexHomeContext({ source: "messages" });
+      const data = await getMessages(match[1], { limit: url.searchParams.get("limit"), before: url.searchParams.get("before") });
+      if ((await refreshCodexHomeContext()).version !== homeState.version) {
+        const error = new Error("Codex home changed; refresh the conversation.");
+        error.status = 409;
+        throw error;
+      }
+      sendJson(res, 200, data);
       return;
     }
     if (req.method !== "GET") {
@@ -3659,7 +3948,7 @@ const server = http.createServer(async (req, res) => {
     await serveStatic(res, decodeURIComponent(url.pathname));
   } catch (error) {
     logError(`[http:error] ${requestMethod} ${url.pathname}: ${error?.stack || error?.message || String(error)}`);
-    sendJson(res, error.status || 500, { error: error.message || "Internal server error" });
+    sendJson(res, error.status || 500, { error: error.message || "Internal server error", ...(error.threadId ? { threadId: error.threadId } : {}) });
   }
 });
 
@@ -3688,6 +3977,7 @@ async function shutdown(signal) {
   } catch (error) {
     logFatalError("IPC client close failed", error);
   }
+  await Promise.all([...appServerClients.values()].map((client) => client.close()));
   await closeServer;
   clearTimeout(timeout);
   logInfo("[shutdown] Complete.");
