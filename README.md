@@ -12,15 +12,17 @@ This is an unofficial tool. It reads local Codex Desktop state and, by default, 
 
 The account/plan usage button (such as Pro / Lite) shares the bottom row with model and reasoning effort selectors. Files, plugins, skills and refresh share the row above with attachment and send controls.
 
+The context usage button between plan usage and the model selector shows the current conversation’s context percentage. Click it for used tokens, window capacity, remaining tokens and the report time. It follows the latest Codex usage report through conversation polling, rather than cumulative usage; missing records display “—”.
+
 On phones, Enter inserts a line break; tap the send button to send a message. This applies to narrow screens (up to 760px) and devices with a coarse primary pointer, including phones in landscape. On desktop, Enter sends and Shift+Enter inserts a line break.
 
-The composer locks message input, attachments, plugin/skill insertion, and model controls while the selected conversation is running; the stop button remains available. The model and reasoning effort selectors use the local Codex catalog and apply your choices with the next message, including the first message of a new conversation. Leave them on “Use current” to inherit the conversation settings. Available efforts depend on the model. Permission settings remain managed by Codex Desktop. If the catalog cannot be loaded, retry from the composer; sending with inherited settings still works.
+While a conversation is running, you can edit and send additional text, references or attachments to its active turn. With empty input and no attachments, the send button becomes Stop; pressing Enter on empty input does not interrupt the task. Model controls remain locked until the turn finishes. The model and reasoning effort selectors use the local Codex catalog and apply your choices with the next message, including the first message of a new conversation. Leave them on “Use current” to inherit the conversation settings. Available efforts depend on the model. Permission settings remain managed by Codex Desktop. If the catalog cannot be loaded, retry from the composer; sending with inherited settings still works.
 
 Plan quota percentages show the remaining allowance (100% minus usage) for both windows; missing records display “-”.
 
 The reasoning selector displays a known conversation effort directly, preferring Desktop settings and falling back to recent conversation metadata. It refreshes while viewing the conversation and keeps “Use current” when the effort cannot be determined.
 
-## Fork updates · 2026-10-25
+## Fork updates · 2026-10-27
 
 This fork is maintained at [luyunyu/codex-lan-companion](https://github.com/luyunyu/codex-lan-companion), based on [dreamingboat/codex-lan-companion](https://github.com/dreamingboat/codex-lan-companion) at `de6ada9`. The upstream project provides the original LAN companion; this fork adds the following improvements:
 
@@ -31,10 +33,14 @@ This fork is maintained at [luyunyu/codex-lan-companion](https://github.com/luyu
 | Display filtering | Hide internal roles, injected instructions and tool records from browser responses without changing the original conversation or model context; retain approvals and important notices. |
 | Subagents | Keep child conversations out of the main sidebar; show running/completed counts, open children read-only and return with the parent draft and history restored. |
 | Composer and skills | Keep drafts per conversation within the page; insert blue skill/plugin references at the caret; use native structured input and the enabled, project-scoped skill catalog; reject stale references before sending. |
-| Models and quota | Choose model and reasoning effort for the next message; recover actual conversation effort when available; lock input during execution; show remaining plan quota. |
+| Questions | Answer questions in a dialog with selectable options and custom text; quote an option to add details, defer a question or hide it in this browser. |
+| Active-turn messages | Send additional text, references and attachments while a task is running; use the send button to stop when the composer is empty. |
+| Context usage | Show the conversation's context percentage; expand used tokens, window capacity, remaining tokens and report time. |
+| Appearance | Follow the system light/dark setting, including changes while the main page is open. |
+| Models and quota | Choose model and reasoning effort for the next message; recover actual conversation effort when available; lock model controls during execution; show remaining plan quota. |
 | New conversation compatibility | Fall back to the local App Server when legacy Desktop creation IPC is unavailable, validate directory and project membership, execute in the background and notify Desktop without switching conversations. |
 
-Validation for this update: syntax checks and 109 automated tests pass; 2 opt-in CLI integration tests are skipped by default. Earlier development sessions exercised browser layouts, new-conversation creation and skill injection on this machine. This is not a guarantee of compatibility with every Desktop build; private IPC and storage formats can change. See [CHANGELOG.md](CHANGELOG.md) for details and the sections below for behavior and limitations.
+Current validation: syntax checks and 155 automated tests pass; 2 opt-in CLI integration tests are skipped by default. Earlier development sessions exercised browser layouts, new-conversation creation and skill injection on this machine; this update did not repeat browser or live Desktop integration checks. Private IPC and storage formats can change. See [CHANGELOG.md](CHANGELOG.md) for details and the sections below for behavior and limitations.
 
 To run this fork from source:
 
@@ -70,6 +76,7 @@ Important compatibility note: this first release was developed and verified only
 - LAN browser UI for Codex Desktop conversations
 - Browser-device access across the LAN: macOS, Windows, Linux, phones, tablets, Kindle/e-readers, smart displays, and more
 - Mobile-friendly conversation list and message view
+- Automatic light/dark appearance following the system setting, including changes while the page is open
 - Codex-style messages with user-only bubbles, hidden internal roles and injected AGENTS.md/environment/Page UI context and standalone skill instructions, and Markdown headings, lists, code, quotes, tables and safe links
 - Live-ish sync, including an active "thinking" indicator
 - Subagent conversations stay out of the sidebar. The parent header shows running/completed counts; click to choose and view a child, including archived children, then go back to restore the parent's unsent input. Child conversations are view-only. Refresh is beside Skills below the composer.
@@ -207,13 +214,17 @@ Use view-only mode:
 codex-lan-companion --readonly
 ```
 
-By default, the web UI can send text, selected plugin or skill mentions, and supported image attachments to Codex through local Desktop IPC or the background App Server connection. Codex Desktop should be open and signed in on the Mac running this service. `--readonly` disables sending, interruption, and approval actions from the browser.
+By default, the web UI can send text, selected plugin or skill mentions, and supported image attachments to Codex through local Desktop IPC or the background App Server connection. Codex Desktop should be open and signed in on the Mac running this service. `--readonly` disables sending, interruption, approvals and question responses from the browser.
+
+Questions from `request_user_input_async` and native `request_user_input` open a dialog with the question and options, plus a custom answer field for every question. **Quote** beside an option copies its label into the custom field and keeps existing additions; selecting a radio option alone does not submit. Answer all questions and choose **Submit answer**. **Later** closes the dialog and retains your draft; reopen it with **Choose / answer** in the conversation. **Close** beside it hides that question and its answer button in this browser, including after page reloads, without submitting an answer. New questions still appear. Polling preserves your edits. Only unanswered questions in the current turn open a dialog; Desktop answers and questions from completed or earlier turns are filtered on first load as well. IPC history alone does not make a question pending. Read-only and subagent views do not allow responses.
+
+The authenticated `POST /api/user-input` endpoint accepts `{ threadId, requestId, answers }`, where `answers` maps the question IDs returned in the messages API to answer strings. It rejects stale requests and duplicate submissions. Async answers use the Desktop question-reply envelope and active-turn steering; blocking questions use their pending server request. Running composer messages use `POST /api/send` with `steer: true`. These private Desktop methods depend on the installed version; failures retain your answer for retry and do not automatically stop or start a turn.
 
 After updating source files, restart Companion before refreshing the page. Refreshing alone loads new frontend files while the running Node.js process still serves its old API. A plain-text 404 from the file browser API now shows a restart hint.
 
-Click **Files** in the composer to browse the current project's root directory. Clicking a folder adds a column to the right while retaining its ancestors; switch folders directly or use the path at the top to return to an ancestor. Columns scroll horizontally on narrow screens. Selecting a file inserts its full path as plain text at the saved caret, replacing selected text and supporting undo. This references a path; it does not read or automatically attach the file contents or create a skill input item. Codex can read the referenced path during execution.
+Click **Files** in the composer to browse the current project's root directory. Clicking a folder adds a column to the right while retaining its ancestors; switch folders directly or use the path at the top to return to an ancestor. Columns scroll horizontally on narrow screens. Selecting a file inserts its full path as plain text at the saved caret, replacing selected text and supporting undo. Hold a folder for about half a second (or press Shift+Enter while focused) to insert the folder path instead; moving or scrolling cancels the hold. This references a path; it does not read or automatically attach the file contents or create a skill input item. Codex can read the referenced path during execution.
 
-The picker reads one directory at a time without building a global search index. Each directory scan is capped at 2000 entries, with a notice when truncated. Multi-root projects offer a root selector; worktree conversations use their actual working directory. Drafts use the selected project root, or the server's launch directory when no project is selected. The authenticated `GET /api/project-files` endpoint returns directory entries within the current account's known project/conversation roots and checks path and symlink boundaries. Account or conversation changes close the picker and discard late responses. File insertion is disabled in read-only mode and while a task is running.
+The picker reads one directory at a time without building a global search index. Each directory scan is capped at 2000 entries, with a notice when truncated. Multi-root projects offer a root selector; worktree conversations use their actual working directory. Drafts use the selected project root, or the server's launch directory when no project is selected. The authenticated `GET /api/project-files` endpoint returns directory entries within the current account's known project/conversation roots and checks path and symlink boundaries. Account or conversation changes close the picker and discard late responses. File insertion is disabled in read-only mode.
 
 The skill picker reads Codex App Server's `skills/list` catalog for the selected conversation's working directory, showing only enabled skills. Codex determines which project, global and plugin skills are available. Cached `SKILL.md` files alone do not make a skill available: old `artifact-template-*` files and disabled skills are excluded. If the native catalog cannot be loaded, discovery reports an error instead of scanning the plugin cache. A send-time check rejects stale skill references before any message or new conversation is submitted.
 
@@ -338,6 +349,7 @@ The server never returns Codex auth tokens to the browser.
 
 ## Known Limitations
 
+- Opening a Companion-created conversation in Codex remote can leave its writer held by another App Server process. Companion tries Desktop IPC when resume reports a writer conflict; if no Desktop receiver is available, sending returns a conflict with guidance to continue in Codex remote or use another conversation. Remote-to-Companion handoff is not currently supported reliably.
 - Compatibility is tied to Codex Desktop local storage and private IPC behavior. Future Codex Desktop updates may break conversation sync, account display, approvals, plugin mentions, sending, or interruption support.
 - Sync is near-real-time rather than push-perfect. Conversation data is refreshed frequently, but some Codex Desktop UI-only states may appear with delay or may not be detectable.
 - The web UI requests the latest 40 user/assistant messages by default, including readable reasoning summaries and progress updates. Scroll to the top or choose **Load earlier messages** to page backward; polling preserves loaded history and reading position. The server scans complete JSONL records backward in byte-bounded chunks until it finds 40 displayable messages or reaches the beginning, retaining only display and lifecycle data. Tool calls and outputs are filtered on the server, are never sent to the browser, and do not count toward the message limit. Important notices and current approvals are kept separately. Reasoning summaries, progress updates and final answers have distinct labels and styles; encrypted records without readable summaries are omitted. A page contains fewer than 40 messages only when it reaches the beginning with fewer remaining messages. Missing files or messages absent from the original records cannot be recovered.
@@ -357,6 +369,8 @@ Recommended defaults:
 - Do not expose the port to the public internet.
 - Do not share terminal screenshots or QR codes with people you do not trust.
 - Use a fixed access code only if you can keep it private.
+
+Subagent status comes from local rollout lifecycle events. Initial status reads search backward up to 8 MiB when the latest 512 KiB omits the turn start. Idle or unknown children remain accessible; a single child opens directly.
 
 ## Stability Notes
 

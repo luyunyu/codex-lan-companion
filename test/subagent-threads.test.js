@@ -78,6 +78,7 @@ test("child navigation is nested, clears the child composer and restores the par
   const requests = [];
   const selection = app.slice(app.indexOf("function selectComposerThread("), app.indexOf("\nfunction t("));
   const api = vm.runInNewContext(`${selection}\n${navigation}\n({ openSubagent, returnToParent, renderSubagents, isSubagentView, closeSubagentMenuOnOutsideClick })`, {
+    syncUserInputDialog() {},
     state, els, escapeHtml: (s) => String(s).replaceAll("<", "&lt;"), t: (key, values) => key === "subagentCounts" ? `${values.running}/${values.completed}` : key.endsWith("Count") ? String(values.count) : key,
     clearSelectedPlugins: () => { state.selectedPlugins = []; }, clearSelectedSkills: () => { state.selectedSkills = []; },
     closePluginMentionMenu() {}, closeSkillMentionMenu() {}, autoResizeComposerInput() {}, closeImagePickerMenu() {}, closeAccountPanel() {}, renderImageAttachments() {}, renderThreads() {}, renderMessages() {}, renderComposerMode() {}, renderSelectedPlugins() {}, renderSelectedSkills() {},
@@ -85,6 +86,10 @@ test("child navigation is nested, clears the child composer and restores the par
   });
   api.renderSubagents();
   assert.equal(els.subagentCounts.innerHTML, "<span>1</span><span>0</span>");
+  state.subagents[0].status = { running: null };
+  api.renderSubagents();
+  assert.equal(els.subagentCounts.innerHTML, "<span>0</span><span>0</span><span>1</span>");
+  state.subagents[0].status = { running: true };
   state.subagentMenuOpen = true;
   // A click on the count span survives the render that replaces that span.
   api.closeSubagentMenuOnOutsideClick({ composedPath: () => [{}, els.subagentButton] });

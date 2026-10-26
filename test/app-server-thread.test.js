@@ -205,3 +205,28 @@ test("App Server sends model and effort overrides without changing permission se
     assert.equal(Object.hasOwn(params, "sandboxPolicy"), false);
   } finally { await client.close(); }
 });
+
+test("native user-input requests stay pending, accept custom answers and resolve on the owning connection", async () => {
+  const mock = fixture();
+  const client = new AppServerThreadClient({ ...options, ...mock });
+  try {
+    await client.startTurn(threadId, [{ type: "text", text: "fixture" }]);
+    mock.emit({ id: 0, method: "item/tool/requestUserInput", params: { threadId, turnId: "test-turn", questions: [{ id: "scope", question: "Pick scope", options: [{ label: "Small" }] }] } });
+    assert.equal(client.pendingApprovals(threadId).length, 1);
+    assert.throws(() => client.respondToApproval(threadId, "0", "accept"), /user-input/);
+    assert.throws(() => client.respondToUserInput("other", "0", { answers: {} }), { status: 409 });
+    assert.throws(() => client.respondToUserInput(threadId, "0", { answers: {} }), { status: 400 });
+    client.respondToUserInput(threadId, "0", { answers: { scope: { answers: ["Small, with extra detail"] } } });
+    assert.equal(client.pendingApprovals(threadId).length, 0);
+    assert.equal(mock.requests.at(-1).id, 0);
+    assert.equal(mock.requests.at(-1).result.answers.scope.answers[0], "Small, with extra detail");
+    await client.steerTurn(threadId, [{ type: "text", text: "More context" }]);
+    assert.equal(mock.requests.at(-1).method, "turn/steer");
+    assert.equal(mock.requests.at(-1).params.expectedTurnId, "test-turn");
+    mock.emit({ id: 8, method: "item/tool/requestUserInput", params: { threadId, questions: [] } });
+    mock.emit({ method: "serverRequest/resolved", params: { requestId: 8 } });
+    assert.equal(client.pendingApprovals(threadId).length, 0);
+    client.active.clear();
+    await assert.rejects(client.steerTurn(threadId, []), { status: 409 });
+  } finally { await client.close(); }
+});

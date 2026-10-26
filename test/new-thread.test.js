@@ -97,6 +97,7 @@ test("the browser leaves draft mode after a partial failure, preserving the sele
   const selection = appSource.slice(appSource.indexOf("function selectComposerThread("), appSource.indexOf("\nfunction t("));
   const state = { composerDrafts: new Map(), selectedId: "draft", draftThread: { id: "draft", cwd: "/repo", projectId: "p", projectName: "Project" } };
   const recover = vm.runInNewContext(`${selection}\n${helper}\nrecoverCreatedDraft`, {
+    syncUserInputDialog() {},
     state, els: { composerInput: { value: "unsent prompt" } }, closePluginMentionMenu() {}, closeSkillMentionMenu() {}, autoResizeComposerInput() {}, DRAFT_THREAD_ID: "draft", clearDraftThread: () => { state.draftThread = null; }, renderThreads() {}, refreshSoon() {}
   });
   assert.equal(recover({ threadId: "created-thread" }), true);

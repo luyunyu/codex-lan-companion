@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — 2026-10-27
+
+Validation: syntax checks pass; 155 automated tests pass and 2 opt-in CLI integration tests are skipped. Browser and live Desktop integration checks were not repeated for this update.
+
+- Follow the system light/dark appearance in the main UI, including live changes, messages, composer controls and pickers.
+
+- Add question dialogs for async and blocking user-input requests, including custom answers, option quoting, preserved drafts and exact pending-request responses. Allow composer editing and active-turn follow-ups while running; keep model controls locked and show Stop when the composer is empty.
+
+- Show per-conversation context usage between plan usage and model selection, with expandable token counts, window capacity and report time from the latest local token event.
+
+- Show the inherited model name before the localized Use current label in the model selector.
+
+- Add Close beside Later in question dialogs. Remember hidden questions in browser storage across reloads without answering them; keep Later temporary and allow new questions.
+
+- Recover subagent lifecycle status beyond the latest 512 KiB with a bounded 8 MiB backward search; include idle/unknown children in header counts instead of displaying only zero running/completed counts.
+
+- Prevent first-load question dialogs from replaying Desktop-answered or older-turn questions. Match async replies using call IDs, reconcile Desktop snapshots and revisioned patches, and require current-turn evidence before treating IPC history as actionable.
+
+- Allow holding a folder for 500 ms or pressing Shift+Enter in the file picker to insert its path; retain click-to-browse navigation and cancel holds on movement, scrolling or dismissal.
+
+- Keep message-view thinking feedback during quiet active turns instead of clearing it after about 10 seconds; reuse sidebar lifecycle status when the message window omits the turn start, while retaining completion, interruption and stale-turn handling.
+- Add a brief loading animation and duplicate-click protection to Refresh; keep its icon centered on mobile by removing native padding and preventing button shrinkage.
+- Report an actionable conflict when an App Server writer conflict falls back to Desktop IPC without an available receiver, retaining both errors as the cause and recording a bounded diagnostic. Recheck Codex home before fallback delivery. Document the Codex remote handoff limitation; this does not resolve Remote-held conversation ownership.
+
 ## Fork update — 2026-10-25
 
 Based on upstream `de6ada9`. This fork update covers project-aware navigation, message history and rendering, subagent views, native skill/plugin input, composer drafts, model controls and App Server creation compatibility. Package version remains `0.1.0`; no npm release is made.

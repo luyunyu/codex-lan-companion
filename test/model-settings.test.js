@@ -35,20 +35,28 @@ test("catalog uses paginated metadata reads, filters hidden models and always cl
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const composer = source.slice(source.indexOf("function renderComposerMode("), source.indexOf("\nasync function loadConfig("));
-test("running conversations disable editing and all insert controls, retain stop, and unlock when idle", () => {
+test("running conversations allow editing and insertion, lock model controls, and retain stop for empty input", () => {
   const element = () => ({ classList: { toggle() {} }, setAttribute() {} });
   const els = Object.fromEntries(["composerInput", "attachButton", "pluginPickerButton", "skillPickerButton", "sendButton", "sendStatus"].map((name) => [name, element()]));
   const state = { config: { allowWrite: true }, selectedId: "thread", threadStatus: { thinking: true } };
   let modelDisabled;
+  let payload = false;
+  let stopMode;
+  els.sendButton.classList.toggle = (_name, value) => { stopMode = value; };
   const render = vm.runInNewContext(`${composer}\nrenderComposerMode`, {
     state, els, DRAFT_THREAD_ID: "draft", syncSkillContext: () => false, isSubagentView: () => false,
-    hasComposerPayload: () => true, renderModelControls: (disabled) => { modelDisabled = disabled; },
+    hasComposerPayload: () => payload, renderModelControls: (disabled) => { modelDisabled = disabled; },
     filePicker: { sync: (disabled) => { els.filePickerButton = { disabled }; } },
     closePluginMentionMenu() {}, closeSkillMentionMenu() {}, closeImagePickerMenu() {}, autoResizeComposerInput() {}, t: (key) => key
   });
   render();
-  for (const name of ["composerInput", "attachButton", "pluginPickerButton", "skillPickerButton", "filePickerButton"]) assert.equal(els[name].disabled, true);
+  for (const name of ["composerInput", "attachButton", "pluginPickerButton", "skillPickerButton", "filePickerButton"]) assert.equal(els[name].disabled, false);
   assert.equal(modelDisabled, true);
+  assert.equal(els.sendButton.disabled, false);
+  assert.equal(stopMode, true);
+  payload = true;
+  render();
+  assert.equal(stopMode, false);
   assert.equal(els.sendButton.disabled, false);
   state.composerBusy = true;
   render();

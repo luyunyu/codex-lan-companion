@@ -1,3 +1,4 @@
+import { installUserInputDialog } from "./user-input-dialog.js";
 import { renderMarkdown, isVisibleMessage, assistantMessageStyle } from "./message-format.js";
 import { mergeMessageHistory } from "./message-history.js";
 import { installInlineComposer } from "./inline-composer.js";
@@ -28,6 +29,7 @@ const state = {
   activeMessageRequest: null,
   account: null,
   accountExpanded: false,
+  contextExpanded: false,
   config: null,
   codexHome: "",
   codexHomeVersion: null,
@@ -83,6 +85,7 @@ const MESSAGE_SYNC_BACKOFF_MAX_MS = 30000;
 const ACCOUNT_SYNC_BACKOFF_MAX_MS = 120000;
 const IMAGE_INPUT_ACCEPT = "image/*";
 const IMAGE_FILE_INPUT_ACCEPT = "*/*";
+const CLOSED_USER_INPUT_STORAGE_KEY = "codexLanClosedUserInput";
 
 const els = {
   shell: document.querySelector("#shell"),
@@ -128,6 +131,8 @@ const els = {
   filePickerButton: document.querySelector("#filePickerButton"),
   filePickerPanel: document.querySelector("#filePickerPanel"),
   accountPanel: document.querySelector("#accountPanel"),
+  contextSummary: document.querySelector("#contextSummary"),
+  contextPanel: document.querySelector("#contextPanel"),
   authGate: document.querySelector("#authGate"),
   authForm: document.querySelector("#authForm"),
   authInput: document.querySelector("#authInput"),
@@ -157,6 +162,7 @@ const I18N = {
     backToParent: "返回父会话",
     subagentCounts: "{running} 进行中 {completed} 已完成",
     subagentRunningCount: "{count} 进行中",
+    subagentOtherCount: "{count} 未运行/未知",
     subagentCompletedCount: "{count} 已完成",
     subagentRunning: "进行中",
     subagentCompleted: "已完成",
@@ -190,6 +196,19 @@ const I18N = {
     collapseNotice: "收起",
     interactionRequired: "需要处理",
     interactionDesktopAction: "等待确认",
+    inputTitle: "需要你的确认",
+    inputLater: "稍后处理",
+    inputClose: "关闭",
+    inputCloseHint: "关闭此提问，不再显示（仅当前浏览器）",
+    inputCustom: "自定义回答 / 补充",
+    inputCustomHint: "输入回答，或引用上方选项后补充",
+    inputQuote: "引用",
+    inputQuoteHint: "将选项复制到自定义回答，可继续补充",
+    inputSubmit: "提交回答",
+    inputSending: "正在提交…",
+    inputFailed: "回答提交失败：{message}",
+    inputOpen: "选择 / 回答",
+    runningInputHint: "可补充消息；输入为空时按钮用于停止任务",
     approvalYes: "是",
     approvalNo: "否",
     approvalAlways: "一直是",
@@ -198,6 +217,13 @@ const I18N = {
     approvalFailed: "审批提交失败：{message}",
     desktopMayNeedAttention: "可能需要桌面处理",
     showUsage: "显示套餐用量",
+    contextLabel: "上下文",
+    contextDetails: "上下文占用详情",
+    contextUsed: "已用 token",
+    contextWindow: "窗口容量",
+    contextRemaining: "剩余 token",
+    contextHint: "基于最近一次 Codex 用量报告，非累计消耗；压缩后随新报告更新。",
+    contextUnavailable: "暂无上下文用量记录。发送消息后随会话更新。",
     send: "发送",
     stop: "停止",
     stopCurrentTask: "停止当前任务",
@@ -261,6 +287,7 @@ const I18N = {
     pluginPickerEmpty: "没有找到匹配插件",
     filePickerTitle: "引用文件",
     filePickerLabel: "文件",
+    fileFolderHint: "点击文件夹进入；长按或 Shift+Enter 引用文件夹路径",
     fileClose: "关闭文件选择器",
     fileRoot: "项目根目录",
     fileCurrentDirectory: "当前目录",
@@ -296,6 +323,7 @@ const I18N = {
     backToParent: "Back to parent conversation",
     subagentCounts: "{running} running {completed} completed",
     subagentRunningCount: "{count} running",
+    subagentOtherCount: "{count} idle/unknown",
     subagentCompletedCount: "{count} completed",
     subagentRunning: "Running",
     subagentCompleted: "Completed",
@@ -329,6 +357,19 @@ const I18N = {
     collapseNotice: "Collapse",
     interactionRequired: "Action required",
     interactionDesktopAction: "Approval pending",
+    inputTitle: "Your input is needed",
+    inputLater: "Later",
+    inputClose: "Close",
+    inputCloseHint: "Hide this question in this browser",
+    inputCustom: "Custom answer / additions",
+    inputCustomHint: "Type an answer, or quote an option and add details",
+    inputQuote: "Quote",
+    inputQuoteHint: "Copy this option into your custom answer to add details",
+    inputSubmit: "Submit answer",
+    inputSending: "Submitting…",
+    inputFailed: "Answer failed: {message}",
+    inputOpen: "Choose / answer",
+    runningInputHint: "Add a message; the button stops the task when the input is empty",
     approvalYes: "Yes",
     approvalNo: "No",
     approvalAlways: "Always",
@@ -337,6 +378,13 @@ const I18N = {
     approvalFailed: "Approval failed: {message}",
     desktopMayNeedAttention: "Desktop may need attention",
     showUsage: "Show plan usage",
+    contextLabel: "Context",
+    contextDetails: "Context usage details",
+    contextUsed: "Used tokens",
+    contextWindow: "Window capacity",
+    contextRemaining: "Remaining tokens",
+    contextHint: "Based on the latest Codex usage report, rather than cumulative usage. Updates after compaction when a new report arrives.",
+    contextUnavailable: "No context usage record yet. Updates as the conversation progresses.",
     send: "Send",
     stop: "Stop",
     stopCurrentTask: "Stop current task",
@@ -400,6 +448,7 @@ const I18N = {
     pluginPickerEmpty: "No matching plugins",
     filePickerTitle: "Reference file",
     filePickerLabel: "Files",
+    fileFolderHint: "Click folders to open; hold or press Shift+Enter to reference their path",
     fileClose: "Close file picker",
     fileRoot: "Project root",
     fileCurrentDirectory: "Current directory",
@@ -465,9 +514,25 @@ const filePicker = installFilePicker({
   onOpen: () => { closePluginMentionMenu(); closeSkillMentionMenu(); closeImagePickerMenu(); closeAccountPanel(); }
 });
 
+const userInputDialog = installUserInputDialog({
+  dialog: document.querySelector("#userInputDialog"), t, escapeHtml,
+  submit: (body) => postJson("/api/user-input", { ...body, threadId: state.selectedId }),
+  onSubmitted: () => { state.messagesSignature = ""; refreshSoon(100); },
+  onUnauthorized: handleUnauthorized,
+  loadClosed: () => safeStorageGet(localStorage, CLOSED_USER_INPUT_STORAGE_KEY),
+  saveClosed: (value) => safeStorageSet(localStorage, CLOSED_USER_INPUT_STORAGE_KEY, value),
+  onClosed: () => { state.messagesSignature = ""; renderCurrentMessages(false); }
+});
+
+function syncUserInputDialog(data = state.lastMessagesData) {
+  userInputDialog.sync(`${state.codexHomeVersion}:${state.selectedId}`, data?.thread?.id === state.selectedId ? data.messages : [],
+    Boolean(state.config?.allowWrite) && !state.authLocked && !isSubagentView(), state.selectedId);
+}
+
 function selectComposerThread(threadId, { moveDraft = false } = {}) {
   const previousId = state.selectedId;
   if (previousId === threadId) return;
+  syncUserInputDialog({ messages: [] });
   const input = els.composerInput;
   if (previousId) {
     if (input.value) state.composerDrafts.set(previousId, input.snapshot ? input.snapshot() : input.value);
@@ -519,6 +584,7 @@ function applyStaticText() {
   els.threadTitle.textContent = t("selectThread");
   els.threadMeta.textContent = t("syncEvery");
   els.messageList.innerHTML = `<div class="empty-state">${escapeHtml(t("pickThread"))}</div>`;
+  renderContextUsage();
   els.accountSummary.setAttribute("title", t("showUsage"));
   els.accountSummary.setAttribute("aria-label", t("showUsage"));
   els.pluginPickerButton.setAttribute("title", t("pluginPickerTitle"));
@@ -608,6 +674,7 @@ function lockApp(message = "") {
   safeStorageRemove(sessionStorage, "codexLanToken");
   safeStorageRemove(localStorage, "codexLanToken");
   state.authToken = "";
+  userInputDialog.reset();
   filePicker.close();
   state.authLocked = true;
   state.threadNavigation = [];
@@ -662,6 +729,10 @@ function formatDuration(ms) {
 
 function renderApprovalActions(message) {
   if (isSubagentView()) return "";
+  if (message.role === "interaction" && message.inputRequest && message.canRespond && message.requiresDesktopAction && message.requestId) {
+    if (userInputDialog.isClosed(message)) return "";
+    return state.config?.allowWrite ? `<button type="button" class="user-input-open" data-request-id="${escapeHtml(String(message.requestId))}">${escapeHtml(t("inputOpen"))}</button>` : "";
+  }
   if (message.role !== "interaction" || !message.canApprove || !message.requestId) return "";
   const submission = state.approvalSubmissions[approvalSubmissionKey(state.selectedId, message.requestId)];
   if (submission?.status === "submitted") {
@@ -1204,6 +1275,8 @@ function removePendingMessage(id) {
 }
 
 function renderMessages(data) {
+  renderContextUsage(data);
+  syncUserInputDialog(data);
   const selected = state.selectedId === DRAFT_THREAD_ID ? state.draftThread : (state.threads.find((thread) => thread.id === state.selectedId) || state.selectedThread);
   els.threadTitle.textContent = selected?.title || data.thread?.title || t("untitled");
   const displayMessages = mergePendingMessages(data).filter(isVisibleMessage);
@@ -1290,6 +1363,35 @@ function usageLine(label, window) {
       <small>${escapeHtml(formatWindow(window.windowMinutes))}${reset ? `${t("separator")}${escapeHtml(t("resetAt", { time: reset }))}` : ""}</small>
     </div>
   `;
+}
+
+function renderContextUsage(data = state.lastMessagesData) {
+  const usage = data?.thread?.id === state.selectedId ? data.contextUsage : null;
+  const percent = usage ? `${Math.round(usage.usedPercent)}%` : "—";
+  els.contextSummary.textContent = `${t("contextLabel")} ${percent}`;
+  els.contextSummary.title = t("contextDetails");
+  els.contextSummary.setAttribute("aria-label", `${t("contextDetails")} · ${percent}`);
+  els.contextSummary.setAttribute("aria-expanded", String(state.contextExpanded));
+  els.contextSummary.classList.toggle("expanded", state.contextExpanded);
+  els.contextPanel.hidden = !state.contextExpanded;
+  els.contextPanel.setAttribute("aria-label", t("contextDetails"));
+  if (!state.contextExpanded) return;
+  const number = (value) => new Intl.NumberFormat(state.locale === "zh" ? "zh-CN" : "en").format(value);
+  const updatedAt = formatResetTime(Date.parse(usage?.updatedAt));
+  els.contextPanel.innerHTML = usage
+    ? `<div class="usage-grid">${[
+      ["contextUsed", usage.usedTokens],
+      ["contextWindow", usage.contextWindow],
+      ["contextRemaining", Math.max(0, usage.contextWindow - usage.usedTokens)]
+    ].map(([label, value]) => `<div class="usage-row"><span>${escapeHtml(t(label))}</span><strong>${escapeHtml(number(value))}</strong></div>`).join("")}</div>
+      <p class="context-note">${escapeHtml(t("contextHint"))}${updatedAt ? ` ${escapeHtml(t("updated", { time: updatedAt }))}` : ""}</p>`
+    : `<div class="usage-empty">${escapeHtml(t("contextUnavailable"))}</div>`;
+}
+
+function closeContextPanel() {
+  if (!state.contextExpanded) return;
+  state.contextExpanded = false;
+  renderContextUsage();
 }
 
 function renderAccount() {
@@ -1783,7 +1885,7 @@ function renderModelControls(disabled) {
   const defaultModel = models.find((model) => model.isDefault);
   const inheritedModel = current.model || (state.selectedId === DRAFT_THREAD_ID ? defaultModel?.model : "");
   const activeModel = models.find((model) => model.model === (selected.model || inheritedModel));
-  const inheritedLabel = inheritedModel ? `${t("inheritSetting")} (${inheritedModel})` : t("inheritSetting");
+  const inheritedLabel = inheritedModel ? `${inheritedModel}(${t("inheritSetting")})` : t("inheritSetting");
   const modelOptions = `<option value="">${escapeHtml(inheritedLabel)}</option>` + models.map((model) =>
     `<option value="${escapeHtml(model.model)}">${escapeHtml(model.displayName)}</option>`).join("");
   const effort = selected.model ? activeModel?.defaultReasoningEffort : current.effort;
@@ -1857,18 +1959,19 @@ function renderComposerMode() {
   const thinking = Boolean(state.threadStatus?.thinking ?? state.selectedThread?.status?.running);
   const hasTarget = Boolean(state.selectedId);
   const canSend = allowWrite && hasTarget && !state.composerBusy && (thinking || hasComposerPayload());
-  const inputDisabled = !allowWrite || state.composerBusy || thinking || !hasTarget;
-  renderModelControls(inputDisabled);
+  const inputDisabled = !allowWrite || state.composerBusy || !hasTarget;
+  const stopMode = allowWrite && thinking && !hasComposerPayload();
+  renderModelControls(inputDisabled || thinking);
   els.composerInput.disabled = inputDisabled;
   els.attachButton.disabled = inputDisabled;
   els.pluginPickerButton.disabled = inputDisabled;
   els.skillPickerButton.disabled = inputDisabled;
   filePicker.sync(inputDisabled);
   els.sendButton.disabled = !canSend;
-  els.sendButton.classList.toggle("stop-mode", allowWrite && thinking);
-  els.sendButton.setAttribute("aria-label", allowWrite && thinking ? t("stopCurrentTask") : t("send"));
-  els.sendButton.setAttribute("title", allowWrite && thinking ? t("stopCurrentTask") : t("send"));
-  els.composerInput.placeholder = isSubagentView() ? t("subagentReadonly") : allowWrite ? (state.selectedId === DRAFT_THREAD_ID ? t("newConversationReady") : t("sendToCodex")) : t("readonlyPlaceholder");
+  els.sendButton.classList.toggle("stop-mode", stopMode);
+  els.sendButton.setAttribute("aria-label", stopMode ? t("stopCurrentTask") : t("send"));
+  els.sendButton.setAttribute("title", stopMode ? t("stopCurrentTask") : t("send"));
+  els.composerInput.placeholder = isSubagentView() ? t("subagentReadonly") : allowWrite ? (thinking ? t("runningInputHint") : state.selectedId === DRAFT_THREAD_ID ? t("newConversationReady") : t("sendToCodex")) : t("readonlyPlaceholder");
   if (!allowWrite) els.sendStatus.textContent = isSubagentView() ? t("subagentReadonly") : t("readonly");
   else if ([t("readonly"), t("subagentReadonly")].includes(els.sendStatus.textContent)) els.sendStatus.textContent = "";
   autoResizeComposerInput();
@@ -1893,6 +1996,7 @@ function applyHomeContext(data) {
   state.codexHome = data.codexHome || state.codexHome;
   state.codexHomeVersion = Number.isFinite(version) ? version : state.codexHomeVersion;
   if (!changed) return false;
+  userInputDialog.reset();
   filePicker.close();
   state.composerDrafts.clear();
   state.modelSelections?.clear();
@@ -1923,6 +2027,8 @@ function applyHomeContext(data) {
   state.approvalSubmissions = {};
   state.expandedNotices = {};
   state.lastMessagesData = null;
+  closeContextPanel();
+  renderContextUsage();
   state.messageHistory = null;
   state.plugins = [];
   state.pluginsLoaded = false;
@@ -2098,12 +2204,15 @@ async function loadMessages(force = false, threadId = state.selectedId) {
       data.nextBefore = previous.nextBefore;
     }
     state.lastMessagesData = data;
+    renderContextUsage(data);
     state.selectedThread = { ...state.selectedThread, ...data.thread };
     state.subagents = data.thread?.subagents || [];
     renderSubagents();
     state.threadStatus = data.status || null;
+    syncUserInputDialog(data);
     renderComposerMode();
-    const signature = `${data.thread?.updatedAtMs || ""}:${data.size || ""}:${data.mtimeMs || ""}:${data.status?.thinking ? "thinking" : "idle"}:${data.status?.interactionRequired ? "interaction" : "clear"}:${data.status?.turnId || ""}:${pendingSignature()}`;
+    const inputSignature = JSON.stringify(data.messages.filter((message) => message.inputRequest).map((message) => [message.requestId, message.requiresDesktopAction]));
+    const signature = `${inputSignature}:${data.thread?.updatedAtMs || ""}:${data.size || ""}:${data.mtimeMs || ""}:${data.status?.thinking ? "thinking" : "idle"}:${data.status?.interactionRequired ? "interaction" : "clear"}:${data.status?.turnId || ""}:${pendingSignature()}`;
     if (force || signature !== state.messagesSignature) {
       const wasNearBottom = isMessageListNearBottom();
       const anchor = captureMessageAnchor();
@@ -2209,8 +2318,10 @@ function renderSubagents() {
   els.subagentButton.hidden = !state.subagents.length;
   const running = state.subagents.filter((thread) => thread.status?.running === true).length;
   const completed = state.subagents.filter((thread) => thread.status?.completed === true).length;
-  const label = t("subagentCounts", { running, completed });
-  els.subagentCounts.innerHTML = `<span>${escapeHtml(t("subagentRunningCount", { count: running }))}</span><span>${escapeHtml(t("subagentCompletedCount", { count: completed }))}</span>`;
+  const other = state.subagents.length - running - completed;
+  const otherLabel = other ? t("subagentOtherCount", { count: other }) : "";
+  const label = [t("subagentCounts", { running, completed }), otherLabel].filter(Boolean).join(" · ");
+  els.subagentCounts.innerHTML = `<span>${escapeHtml(t("subagentRunningCount", { count: running }))}</span><span>${escapeHtml(t("subagentCompletedCount", { count: completed }))}</span>${other ? `<span>${escapeHtml(otherLabel)}</span>` : ""}`;
   els.subagentButton.setAttribute("aria-label", `${t("viewSubagents")}: ${label}`);
   els.subagentButton.setAttribute("aria-expanded", String(state.subagentMenuOpen));
   els.subagentMenu.hidden = !state.subagentMenuOpen || !state.subagents.length;
@@ -2356,7 +2467,22 @@ els.newThreadButton.addEventListener("click", () => {
   if (shouldRefocusComposer()) els.composerInput.focus();
 });
 
-els.refreshButton.addEventListener("click", () => refresh(true));
+els.refreshButton.addEventListener("click", async () => {
+  if (els.refreshButton.disabled) return;
+  els.refreshButton.disabled = true;
+  els.refreshButton.classList.add("is-refreshing");
+  els.refreshButton.setAttribute("aria-busy", "true");
+  try {
+    await Promise.all([
+      refresh(true),
+      new Promise((resolve) => setTimeout(resolve, 500))
+    ]);
+  } finally {
+    els.refreshButton.disabled = false;
+    els.refreshButton.classList.remove("is-refreshing");
+    els.refreshButton.removeAttribute("aria-busy");
+  }
+});
 
 els.sidebarCloseButton?.addEventListener("click", () => {
   state.sidebarCollapsed = true;
@@ -2402,6 +2528,8 @@ els.messageList.addEventListener("click", async (event) => {
     return;
   }
 
+  const inputButton = event.target.closest(".user-input-open");
+  if (inputButton) { userInputDialog.open(inputButton.dataset.requestId); return; }
   const button = event.target.closest(".approval-action");
   if (!button) return;
   event.preventDefault();
@@ -2487,9 +2615,23 @@ els.draftProjectSelect.addEventListener("change", (event) => {
 
 
 els.accountSummary.addEventListener("click", () => {
+  closeContextPanel();
   state.accountExpanded = !state.accountExpanded;
   renderAccount();
   if (state.accountExpanded) loadAccount();
+});
+
+els.contextSummary.addEventListener("click", () => {
+  closeAccountPanel();
+  state.contextExpanded = !state.contextExpanded;
+  renderContextUsage();
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.contextExpanded) {
+    closeContextPanel();
+    els.contextSummary.focus();
+  }
 });
 
 els.pluginPickerButton.addEventListener("click", () => {
@@ -2511,6 +2653,7 @@ els.skillPickerButton.addEventListener("click", () => {
 });
 
 document.addEventListener("click", (event) => {
+  if (state.contextExpanded && !els.contextPanel.contains(event.target) && !els.contextSummary.contains(event.target)) closeContextPanel();
   if (state.accountExpanded && !els.accountPanel.contains(event.target) && !els.accountSummary.contains(event.target)) {
     closeAccountPanel();
   }
@@ -2630,6 +2773,7 @@ els.composerInput.addEventListener("keydown", (event) => {
   }
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
+    if ((state.threadStatus?.thinking ?? state.selectedThread?.status?.running) && !hasComposerPayload()) return;
     els.composerForm.requestSubmit();
   }
 });
@@ -2727,8 +2871,9 @@ els.composerForm.addEventListener("submit", async (event) => {
   const sendMessage = composerSendMessage(message);
   const images = [...state.imageAttachments];
   if (!thinking && !sendMessage && !images.length) return;
+  const stopping = thinking && !sendMessage && !images.length;
   const previousThreadStatus = state.threadStatus;
-  const pendingMessageId = thinking || isDraftThread ? null : addPendingUserMessage(state.selectedId, sendMessage, images);
+  const pendingMessageId = stopping || isDraftThread ? null : addPendingUserMessage(state.selectedId, sendMessage, images);
   state.composerBusy = true;
   renderProjectControls();
   if (!thinking && !isDraftThread) {
@@ -2739,7 +2884,7 @@ els.composerForm.addEventListener("submit", async (event) => {
   renderComposerMode();
   els.sendStatus.textContent = "";
   try {
-    if (thinking) {
+    if (stopping) {
       await postJson("/api/interrupt", { threadId: state.selectedId });
       state.threadStatus = { ...(state.threadStatus || {}), thinking: false };
       state.messagesSignature = "";
@@ -2750,11 +2895,12 @@ els.composerForm.addEventListener("submit", async (event) => {
         message: sendMessage,
         threadId: isDraftThread ? null : state.selectedId,
         newThread: isDraftThread,
+        steer: thinking,
         projectId: isDraftThread ? state.draftThread?.projectId || "" : "",
-        ...state.modelSelections.get(state.selectedId),
+        ...(thinking ? {} : state.modelSelections.get(state.selectedId)),
         images: images.map(({ name, mimeType, data }) => ({ name, mimeType, data }))
       });
-      state.currentModelSettings = { ...state.currentModelSettings, ...state.modelSelections.get(state.selectedId) };
+      if (!thinking) state.currentModelSettings = { ...state.currentModelSettings, ...state.modelSelections.get(state.selectedId) };
       state.composerDrafts.delete(state.selectedId);
       els.composerInput.value = "";
       autoResizeComposerInput();
@@ -2776,7 +2922,7 @@ els.composerForm.addEventListener("submit", async (event) => {
   } catch (error) {
     if (pendingMessageId) removePendingMessage(pendingMessageId);
     if (isDraftThread) recoverCreatedDraft(error);
-    if (!thinking) {
+    if (!stopping) {
       state.threadStatus = previousThreadStatus;
       state.messagesSignature = "";
       renderCurrentMessages(true);
@@ -2787,7 +2933,7 @@ els.composerForm.addEventListener("submit", async (event) => {
       els.imageFileInput.value = "";
       renderImageAttachments();
     }
-    els.sendStatus.textContent = t(thinking ? "interruptFailed" : "sendFailed", { message: error.message });
+    els.sendStatus.textContent = t(stopping ? "interruptFailed" : "sendFailed", { message: error.message });
   } finally {
     state.composerBusy = false;
     renderProjectControls();

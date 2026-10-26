@@ -9,7 +9,8 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import qrcode from "qrcode-terminal";
-import { readDesktopIpcVersions, desktopRequestEnvelope, desktopStartTurnParams, desktopThreadAvailableBroadcast } from "./lib/desktop-ipc-protocol.js";
+import { readDesktopIpcVersions, desktopRequestEnvelope, desktopStartTurnParams, desktopThreadAvailableBroadcast, desktopSteerTurnParams } from "./lib/desktop-ipc-protocol.js";
+import { userInputRequest, validateUserInputAnswers, userInputReplyText, answeredUserInputIds, userInputResolved, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds } from "./lib/user-input-requests.js";
 import { desktopUserInput } from "./lib/desktop-user-input.js";
 import { readNativeSkills, assertAvailableSkillReferences } from "./lib/native-skills.js";
 import { AppServerThreadClient } from "./lib/app-server-thread.js";
@@ -231,6 +232,8 @@ const sessionMetadataReader = new SessionMetadataReader();
 const IPC_VERSION_BY_METHOD = {
   "thread-follower-start-turn": 1,
   "thread-follower-interrupt-turn": 1,
+  "thread-follower-steer-turn": 1,
+  "thread-follower-submit-user-input": 1,
   "thread-follower-command-approval-decision": 1,
   "thread-follower-file-approval-decision": 1,
   "thread-follower-permissions-request-approval-response": 1
@@ -247,6 +250,8 @@ const jsonHeaders = {
 };
 
 const messageCache = new Map();
+const userInputSubmissions = new Set();
+const userInputInFlight = new Set();
 const recentNotices = [];
 let codexIpcClient = null;
 const appServerClients = new Map();
@@ -568,6 +573,8 @@ function clearHomeScopedCaches() {
   threadsCache = null;
   threadsInFlight = null;
   messageCache.clear();
+  userInputSubmissions.clear();
+  userInputInFlight.clear();
   threadStatusReader.clear();
   sessionMetadataReader.clear();
   recentNotices.splice(0, recentNotices.length);
@@ -2118,6 +2125,7 @@ const INTERACTION_TYPE_PATTERNS = [
   "elicitation",
   "request_user_input",
   "user_input_request",
+  "requestuserinput",
   "terminal_interaction",
   "dynamic_tool_call_request",
   "command_approval",
@@ -2160,7 +2168,8 @@ function redactLargePayloads(value, depth = 0) {
 }
 
 function isInteractionPayload(payload) {
-  if (isApprovalDecisionPayload(payload)) return false;
+  if (isApprovalDecisionPayload(payload) || payload?.completed === true) return false;
+  if (userInputRequest(payload)) return true;
   const toolArguments = parseMaybeJsonObject(payload?.arguments);
   const params = payload?.params || payload?.payload || {};
   if (
@@ -2304,6 +2313,7 @@ function interactionContent(payload) {
 function interactionRequestId(payload) {
   const params = payload?.params || payload?.payload || {};
   const request = payload?.request || params?.request || {};
+  if (payload?.id === 0) return 0;
   return (
     payload?.request_id ||
     payload?.requestId ||
@@ -2329,7 +2339,7 @@ function interactionRequestId(payload) {
 function collectInteractionPayloads(value, depth = 0, seen = new Set(), results = []) {
   if (!value || typeof value !== "object" || depth > 12 || seen.has(value)) return results;
   seen.add(value);
-  if (isInteractionPayload(value) && interactionRequestId(value)) results.push(value);
+  if (isInteractionPayload(value) && interactionRequestId(value) != null) results.push(value);
   if (Array.isArray(value)) {
     for (const item of value) collectInteractionPayloads(item, depth + 1, seen, results);
     return results;
@@ -2349,7 +2359,7 @@ function interactionPayloadsFromIpcMessage(message) {
   });
   const bestPriority = Math.min(...unique.map(interactionPayloadPriority));
   return unique
-    .filter((payload) => interactionPayloadPriority(payload) === bestPriority || bestPriority > 1)
+    .filter((payload) => userInputRequest(payload) || interactionPayloadPriority(payload) === bestPriority || bestPriority > 1)
     .sort((a, b) => interactionPayloadPriority(a) - interactionPayloadPriority(b));
 }
 
@@ -2363,16 +2373,19 @@ function interactionPayloadPriority(payload) {
 function messageFromInteractionEvent(timestamp, payload, meta = {}) {
   if (!isInteractionPayload(payload)) return null;
   const approvalKind = approvalKindFromPayload(payload);
+  const inputRequest = userInputRequest(payload);
   return {
     role: "interaction",
     kind: payload?.type || payload?.method || payload?.name || "interaction",
     timestamp,
     ...meta,
+    turnId: firstString(payload?.params?.turnId, payload?.turnId, payload?.turn_id, payload?.internal_chat_message_metadata_passthrough?.turn_id, meta.turnId) || null,
     title: interactionTitle(payload),
-    requestId: interactionRequestId(payload),
+    requestId: inputRequest ? String(interactionRequestId(payload) ?? inputRequest.sourceId) : interactionRequestId(payload),
     approvalKind,
     canApprove: Boolean(approvalKind),
-    content: interactionContent(payload),
+    ...(inputRequest ? { inputRequest, canRespond: inputRequest.mode === "async" || ["desktop-ipc", "app-server"].includes(meta.source) } : {}),
+    content: inputRequest ? inputRequest.questions.map((question) => question.title).join("\n\n") : interactionContent(payload),
     requiresDesktopAction: true
   };
 }
@@ -2391,6 +2404,7 @@ function interactionContentField(content, label) {
 
 function interactionDedupeKey(message) {
   if (message?.role !== "interaction") return "";
+  if (message.inputRequest) return `user-input:${message.inputRequest.mode}:${message.inputRequest.mode === "async" ? message.inputRequest.sourceId : JSON.stringify(message.inputRequest.questions)}`;
   const prompt = interactionContentField(message.content, "Prompt");
   const command = normalizeApprovalCommandForKey(interactionContentField(message.content, "Command"));
   const workdir = interactionContentField(message.content, "Workdir");
@@ -2411,6 +2425,7 @@ function preferredInteractionMessage(existing, candidate) {
     requestId: live.requestId || display.requestId,
     approvalKind: live.approvalKind || display.approvalKind,
     canApprove: live.canApprove || display.canApprove,
+    ...(live.inputRequest ? { inputRequest: live.inputRequest, canRespond: live.canRespond } : {}),
     requiresDesktopAction: Boolean(live.requiresDesktopAction || display.requiresDesktopAction),
     lineNumber: Math.min(existing.lineNumber || candidate.lineNumber || 0, candidate.lineNumber || existing.lineNumber || 0),
     timestamp: display.timestamp || live.timestamp
@@ -2729,8 +2744,10 @@ function createRolloutParseState(stat, nowMs) {
     reasoningEvents: [],
     reasoningFallbacks: [],
     interactionMessages: [],
+    answeredInputIds: new Set(),
     noticeMessages: [],
     meta: {},
+    contextUsage: null,
     lineNumber: 0,
     activeTurn: null,
     openTurns: new Map(),
@@ -2745,12 +2762,27 @@ function parseRolloutLine(line, state, sourceOffset) {
   try {
     const entry = typeof line === "string" ? JSON.parse(line) : line;
     const entryAtMs = Date.parse(entry.timestamp);
+    if (entry.payload?.type === "user_message" || (entry.payload?.type === "message" && entry.payload.role === "user")) {
+      const text = entry.payload.message || textFromContent(entry.payload.content);
+      for (const id of answeredUserInputIds(text)) state.answeredInputIds.add(id);
+    }
     if (Number.isFinite(entryAtMs)) state.lastEntryAtMs = entryAtMs;
     if (entry.type === "session_meta") {
       state.meta = { ...state.meta, ...(entry.payload || {}) };
       return;
     }
     if (entry.type === "event_msg") {
+      if (entry.payload?.type === "token_count") {
+        const info = entry.payload.info;
+        if (info) {
+          const usedTokens = info.last_token_usage?.total_tokens;
+          const contextWindow = info.model_context_window;
+          state.contextUsage = Number.isFinite(usedTokens) && usedTokens >= 0 && Number.isFinite(contextWindow) && contextWindow > 0
+            ? { usedTokens, contextWindow, usedPercent: Math.min(100, usedTokens / contextWindow * 100), updatedAt: entry.timestamp || null }
+            : null;
+        }
+        return;
+      }
       if (entry.payload?.type === "task_started") {
         const turn = {
           turnId: entry.payload.turn_id || null,
@@ -2797,6 +2829,7 @@ function parseRolloutLine(line, state, sourceOffset) {
       return;
     }
     if (entry.type === "response_item") {
+      if (entry.payload?.type === "function_call_output") state.answeredInputIds.add(entry.payload.call_id);
       const messageMeta = {
         turnId: state.activeTurn?.turnId || null,
         turnStartedAtMs: state.activeTurn?.startedAtMs || null
@@ -2832,18 +2865,20 @@ function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false 
   const chatSource = state.eventMessages.length || state.preferredChatSource === "event" ? "event" : "response";
   const chatMessages = (chatSource === "event" ? state.eventMessages : state.fallbackMessages)
     .filter((message) => message.role === "user" || message.role === "assistant");
-  if (partial) {
-    const recentOpenTurn = [...state.openTurns.values()].at(-1) || null;
-    const fileRecentlyUpdated = nowMs - Math.max(state.lastEntryAtMs || 0, stat.mtimeMs || 0) < ACTIVE_STATUS_CACHE_MS * 2;
-    state.activeTurn = fileRecentlyUpdated ? recentOpenTurn : null;
-  }
   const activeTurnLastUpdatedAtMs = state.activeTurn
     ? Math.max(state.activeTurn.startedAtMs || 0, state.lastEntryAtMs || 0, Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : 0)
     : null;
   const activeTurnStale = Boolean(state.activeTurn && nowMs - activeTurnLastUpdatedAtMs > ACTIVE_TURN_STALE_MS);
   const visibleActiveTurn = activeTurnStale ? null : state.activeTurn;
   for (const message of state.interactionMessages) {
-    message.requiresDesktopAction = Boolean(visibleActiveTurn && (!message.turnId || message.turnId === visibleActiveTurn.turnId));
+    const input = message.inputRequest;
+    const answered = input && (input.mode === "async"
+      ? userInputAnswered(input, state.answeredInputIds)
+      : state.answeredInputIds.has(input.callId));
+    const currentInputTurn = visibleActiveTurn && (message.turnId
+      ? message.turnId === visibleActiveTurn.turnId
+      : !visibleActiveTurn.turnId && message.turnStartedAtMs != null && message.turnStartedAtMs === visibleActiveTurn.startedAtMs);
+    message.requiresDesktopAction = Boolean(!answered && visibleActiveTurn && (input ? currentInputTurn : !message.turnId || message.turnId === visibleActiveTurn.turnId));
   }
   const reasoningMessages = state.reasoningEvents.length ? state.reasoningEvents : state.reasoningFallbacks;
   const pendingInteractions = state.interactionMessages.filter((message) => message.requiresDesktopAction);
@@ -2851,6 +2886,7 @@ function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false 
   return {
     chatSource,
     meta: state.meta,
+    contextUsage: state.contextUsage,
     file: filePath,
     size: stat.size,
     mtimeMs: stat.mtimeMs,
@@ -2880,8 +2916,9 @@ function mapRolloutHistoryLine(line) {
       return { type: entry.type, timestamp: entry.timestamp, payload: { type: "reasoning", summary: payload.summary } };
     }
     if (entry.type === "response_item" && payload.type === "message") return entry;
-    if (entry.type === "event_msg" && ["user_message", "agent_message", "agent_reasoning", "task_started", "task_complete", "turn_aborted"].includes(payload.type)) return entry;
+    if (entry.type === "event_msg" && ["user_message", "agent_message", "agent_reasoning", "task_started", "task_complete", "turn_aborted", "token_count"].includes(payload.type)) return entry;
     if (!["event_msg", "response_item"].includes(entry.type)) return null;
+    if (payload.type === "function_call_output") return { type: entry.type, timestamp: entry.timestamp, payload: { type: payload.type, call_id: payload.call_id } };
     if (isInteractionPayload(payload)) return entry;
     if (messageFromNoticeEvent(entry.timestamp, payload)) return entry;
     return null;
@@ -2906,6 +2943,12 @@ async function parseRolloutTail(filePath, stat, limit, nowMs, before = null) {
     result = rolloutResultFromState({ filePath, stat, nowMs, state, partial: window.startOffset > 0 });
     cursor = window.startOffset;
   } while (cursor > 0 && result.messages.filter((message) => message.role === "user" || message.role === "assistant").length < normalizedLimit);
+  if (before == null && result.partial && !result.status.thinking) {
+    // The message window may omit task_started; reuse the sidebar's bounded
+    // lifecycle reader without retaining or exposing tool records.
+    const lifecycle = await threadStatusReader.read(filePath, nowMs);
+    if (lifecycle.running === true) result.status.thinking = true;
+  }
   return {
     ...result,
     historyStart: window.startOffset,
@@ -2968,14 +3011,21 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
   }
   const localInteractions = (appServerClients.get(id)?.pendingApprovals(id) || []).map((request, index) =>
     messageFromInteractionEvent(request.timestamp, { ...request, requestId: String(request.id) }, { source: "app-server", lineNumber: 1200000 + index })).filter(Boolean);
-  const ipcInteractions = [...(codexIpcClient?.getRecentInteractionMessages(id) || []), ...localInteractions];
+  const events = (codexIpcClient?.events || []).filter((event) => String(codexIpcClient.conversationIdFromMessage(event.message)) === String(id));
+  const desktopInputState = desktopUserInputState(events);
+  const pendingDesktopInputs = desktopPendingAsyncInputIds(desktopInputState);
+  const pendingInput = (message) => !message.inputRequest || (!userInputSubmissions.has(JSON.stringify([codexPaths().home, id, String(message.requestId)]))
+    && !userInputSubmissions.has(JSON.stringify([codexPaths().home, id, interactionDedupeKey(message)]))
+    && !userInputResolved(message.inputRequest, message.requestId, events, desktopInputState));
+  const ipcInteractions = [...(codexIpcClient?.getRecentInteractionMessages(id) || []), ...localInteractions].filter(pendingInput);
   const ipcNotices = codexIpcClient?.getRecentNoticeMessages(id) || [];
   const serverNotices = getRecentNoticeMessages(id);
   const liveMessages = [...ipcInteractions, ...ipcNotices, ...serverNotices];
   const rolloutPath = resolveRolloutPath(thread.rolloutPath);
   if (!rolloutPath || !existsSync(rolloutPath)) {
-    const messages = dedupeInteractionMessages(liveMessages).sort(messageSortCompare);
-    const limited = limitMessagesForClient(messages, { thinking: false, interactionRequired: ipcInteractions.some((message) => message.requiresDesktopAction) }, limit);
+    const messages = dedupeInteractionMessages(liveMessages.filter((message) => message.inputRequest?.mode !== "async"
+      || pendingDesktopInputs.has(message.inputRequest.sourceId))).sort(messageSortCompare);
+    const limited = limitMessagesForClient(messages, { thinking: false, interactionRequired: messages.some((message) => message.requiresDesktopAction) }, limit);
     return {
       thread,
       meta: {},
@@ -2986,7 +3036,7 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
         thinking: false,
         turnId: null,
         startedAtMs: null,
-        interactionRequired: ipcInteractions.some((message) => message.requiresDesktopAction),
+        interactionRequired: messages.some((message) => message.requiresDesktopAction),
         possibleDesktopAttention: false
       },
       ...limited
@@ -3001,14 +3051,22 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
   }
   const parsed = await parseRollout(rolloutPath, { limit, preferTail: true });
   if (!liveMessages.length) {
-    const limited = limitMessagesForClient(parsed.messages, parsed.status, limit, parsed.historyStart);
-    return { thread, ...parsed, ...limited };
+    const limited = limitMessagesForClient(parsed.messages.filter(pendingInput), parsed.status, limit, parsed.historyStart);
+    const status = { ...parsed.status, interactionRequired: limited.messages.some((message) => message.requiresDesktopAction) };
+    return { thread, ...parsed, ...limited, status };
   }
   const status = {
     ...parsed.status,
     interactionRequired: parsed.status?.interactionRequired || ipcInteractions.some((message) => message.requiresDesktopAction)
   };
-  const messages = dedupeInteractionMessages([...parsed.messages, ...liveMessages]).sort(messageSortCompare);
+  // IPC snapshots contain completed turns too. Async calls are actionable only
+  // when the current rollout also identifies them as pending, never on replay alone.
+  const pendingRolloutInputs = new Set(parsed.messages.filter((message) => message.inputRequest?.mode === "async").map((message) => message.inputRequest.sourceId));
+  const currentLiveMessages = liveMessages.filter((message) => !message.inputRequest
+    || (message.inputRequest.mode === "async" ? pendingRolloutInputs.has(message.inputRequest.sourceId)
+      : !parsed.status.turnId || !message.turnId || message.turnId === parsed.status.turnId));
+  const messages = dedupeInteractionMessages([...parsed.messages, ...currentLiveMessages].filter(pendingInput)).sort(messageSortCompare);
+  status.interactionRequired = messages.some((message) => message.requiresDesktopAction);
   const limited = limitMessagesForClient(messages, status, limit, parsed.historyStart);
   return {
     thread,
@@ -3194,7 +3252,7 @@ async function getModels(threadId = "") {
   return { models, settings };
 }
 
-async function sendToCodex(text, threadId, images = [], { newThread = false, projectId = "", model, effort } = {}) {
+async function sendToCodex(text, threadId, images = [], { newThread = false, projectId = "", model, effort, steer = false } = {}) {
   await refreshCodexHomeContext({ source: "send" });
   if (!ALLOW_WRITE) {
     const err = new Error("Read-only mode is enabled. Restart without --readonly to send messages to Codex Desktop.");
@@ -3218,7 +3276,7 @@ async function sendToCodex(text, threadId, images = [], { newThread = false, pro
     const catalog = await getSkills(skillThreadId, newThread ? projectId : "");
     assertAvailableSkillReferences(trimmed, catalog.skills);
   }
-  const settings = model != null || effort != null
+  const settings = !steer && (model != null || effort != null)
     ? validateModelSettings({ model, effort }, (await getModels()).models) : {};
   if (newThread) {
     if (normalizedImages.length) {
@@ -3254,16 +3312,43 @@ async function sendToCodex(text, threadId, images = [], { newThread = false, pro
     throw err;
   }
 
+  if (steer) {
+    const localClient = appServerClients.get(targetThreadId);
+    const response = localClient?.active.has(targetThreadId)
+      ? await localClient.steerTurn(targetThreadId, desktopUserInput(trimmed, normalizedImages))
+      : await getCodexIpcClient().request("thread-follower-steer-turn", desktopSteerTurnParams(
+        targetThreadId, desktopUserInput(trimmed, normalizedImages), randomUUID(), { text: trimmed, cwd: targetThread.cwd }
+      ));
+    return { ok: true, mode: localClient?.active.has(targetThreadId) ? "app-server" : "desktop-ipc", threadId: targetThreadId,
+      turnId: response?.turnId || response?.result?.result?.turnId || null, sentAt: new Date().toISOString() };
+  }
+
   if (await isAppServerThread(targetThread)) {
     const home = codexPaths().home;
     const client = await getLocalAppServerClient(home, targetThreadId);
-    // Resuming sends no input. If Desktop already owns the thread, use its
-    // existing owner without opening or navigating a Desktop window.
+    // Resuming sends no input. A writer conflict does not prove that Desktop
+    // has an IPC owner; try its existing route without navigating a window.
     try { await client.resumeThread(targetThreadId); } catch (error) {
       await client.close();
       if (!/writer|already.*(load|open|use)|locked/i.test(error.message || "")) throw error;
-      const response = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
+      if ((await refreshCodexHomeContext({ source: "send" })).home !== home) {
+        throw Object.assign(new Error("Codex home changed; refresh before sending."), { status: 409 });
+      }
+      let response;
+      try {
+        response = await getCodexIpcClient().startTurn(targetThreadId, trimmed, normalizedImages, settings);
+      } catch (ipcError) {
+        if (!isNoOpenOwnerError(ipcError)) throw ipcError;
+        logInfo("[send:owner-unavailable] App Server resume hit a writer conflict; Desktop IPC found no available owner.");
+        const err = new Error("This conversation is held by another Codex process, but no Desktop IPC receiver is available. This can happen after opening it in Codex remote. Continue there, or use another conversation in Companion.", {
+          cause: new AggregateError([error, ipcError], "App Server resume and Desktop IPC fallback failed")
+        });
+        err.status = 409;
+        recordNotice(targetThreadId, { severity: "error", title: "Send failed", content: err.message, source: "send" });
+        throw err;
+      }
       return { ok: true, mode: "desktop-ipc", threadId: targetThreadId,
+        images: normalizedImages.map(({ name, mimeType, size }) => ({ name, mimeType, size })),
         turnId: response?.result?.result?.turn?.id || null, sentAt: new Date().toISOString() };
     }
     if ((await refreshCodexHomeContext({ source: "send" })).home !== home) {
@@ -3759,6 +3844,44 @@ async function respondToApproval({ threadId, requestId, decision, approvalKind }
   };
 }
 
+async function respondToUserInput({ threadId, requestId, answers } = {}) {
+  if (!ALLOW_WRITE) throw Object.assign(new Error("Read-only mode is enabled."), { status: 403 });
+  if (typeof threadId !== "string" || typeof requestId !== "string" || !threadId || !requestId) {
+    throw Object.assign(new Error("Select a conversation and a pending input request."), { status: 400 });
+  }
+  await refreshCodexHomeContext({ source: "user-input" });
+  const home = codexPaths().home;
+  const key = JSON.stringify([home, threadId, requestId]);
+  if (userInputSubmissions.has(key) || userInputInFlight.has(key)) throw Object.assign(new Error("This answer was already submitted or is being submitted."), { status: 409 });
+  userInputInFlight.add(key);
+  try {
+    const data = await getMessages(threadId);
+    const message = data.messages.find((message) => String(message.requestId) === requestId && message.inputRequest && message.canRespond && message.requiresDesktopAction);
+    if (!message || codexPaths().home !== home) throw Object.assign(new Error("This input request is no longer pending. Refresh the conversation."), { status: 409 });
+    const request = message.inputRequest;
+    const validated = validateUserInputAnswers(request, answers);
+    const localClient = appServerClients.get(threadId);
+    if (request.mode === "blocking") {
+      const response = { answers: Object.fromEntries(Object.entries(validated).map(([id, answer]) => [id, { answers: [answer] }])) };
+      if (message.source === "app-server") localClient.respondToUserInput(threadId, requestId, response);
+      else await getCodexIpcClient().request("thread-follower-submit-user-input", {
+        hostId: "local", conversationId: threadId, requestId, response
+      });
+    } else {
+      const input = desktopUserInput(userInputReplyText(request, validated));
+      if (localClient?.active.has(threadId)) await localClient.steerTurn(threadId, input);
+      else await getCodexIpcClient().request("thread-follower-steer-turn", desktopSteerTurnParams(
+        threadId, input, randomUUID(), { text: userInputReplyText(request, validated), cwd: data.thread?.cwd }
+      ));
+    }
+    userInputSubmissions.add(key);
+    userInputSubmissions.add(JSON.stringify([home, threadId, interactionDedupeKey(message)]));
+    return { ok: true, threadId, requestId };
+  } finally {
+    userInputInFlight.delete(key);
+  }
+}
+
 async function serveStatic(res, pathname) {
   const requested = pathname === "/" ? "/index.html" : pathname;
   const filePath = path.normalize(path.join(PUBLIC_DIR, requested));
@@ -3893,7 +4016,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/send") {
       if (!requireAuthorized(req, res, url)) return;
       const body = await readJsonBody(req, MAX_SEND_BODY_BYTES);
-      sendJson(res, 200, await sendToCodex(body.message, body.threadId, body.images, { newThread: Boolean(body.newThread), projectId: body.projectId, model: body.model, effort: body.effort }));
+      sendJson(res, 200, await sendToCodex(body.message, body.threadId, body.images, { newThread: Boolean(body.newThread), projectId: body.projectId, model: body.model, effort: body.effort, steer: body.steer === true }));
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/new-thread") {
@@ -3910,6 +4033,12 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuthorized(req, res, url)) return;
       const body = await readJsonBody(req);
       sendJson(res, 200, await interruptCodex(body.threadId));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/api/user-input") {
+      if (!requireAuthorized(req, res, url)) return;
+      const body = await readJsonBody(req);
+      sendJson(res, 200, await respondToUserInput(body));
       return;
     }
     if (req.method === "POST" && url.pathname === "/api/approval") {

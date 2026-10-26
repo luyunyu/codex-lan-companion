@@ -53,7 +53,7 @@ test("unchanged active files expire and file replacement cannot retain the old s
 });
 
 test("large files stay bounded and missing lifecycle evidence remains unknown", async (t) => {
-  const { file, reader } = await fixture(t, { maxBytes: 1024 });
+  const { file, reader } = await fixture(t, { maxBytes: 1024, maxScanBytes: 1024 });
   await fs.writeFile(file, event("task_started"));
   await reader.read(file);
   await fs.appendFile(file, JSON.stringify({ type: "response_item", payload: { text: "x".repeat(4096) } }) + "\n");
@@ -69,7 +69,7 @@ test("large files stay bounded and missing lifecycle evidence remains unknown", 
 });
 
 test("incremental polling retains lifecycle state beyond the initial tail window", async (t) => {
-  const { file, reader } = await fixture(t, { maxBytes: 1024 });
+  const { file, reader } = await fixture(t, { maxBytes: 1024, maxScanBytes: 1024 });
   await fs.writeFile(file, event("task_started"));
   await reader.read(file);
   for (let i = 0; i < 8; i += 1) {
@@ -108,4 +108,19 @@ test("sidebar adds and removes its running badge from each poll's status", () =>
   state.threads[0].status.running = null;
   render();
   assert.doesNotMatch(els.threadList.innerHTML, /thread-running/);
+});
+
+
+test("cold status reads recover a start outside the tail and follow later completion", async (t) => {
+  const { file, reader } = await fixture(t, { maxBytes: 1024, maxScanBytes: 8192 });
+  await fs.writeFile(file, event("task_started") + JSON.stringify({ type: "response_item", payload: { text: "x".repeat(4096) } }) + "\n");
+  assert.equal((await reader.read(file)).running, true);
+  await fs.appendFile(file, event("task_complete"));
+  assert.equal((await reader.read(file)).completed, true);
+  reader.clear();
+  assert.equal((await reader.read(file)).completed, true);
+  await fs.appendFile(file, event("task_started", "next"));
+  await fs.appendFile(file, JSON.stringify({ type: "response_item", payload: { text: "x".repeat(4096) } }) + "\n");
+  reader.clear();
+  assert.equal((await reader.read(file)).running, true);
 });

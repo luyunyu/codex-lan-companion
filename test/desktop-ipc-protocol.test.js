@@ -149,3 +149,15 @@ test("model overrides update Desktop thread settings before sending and reject u
   assert.equal(calls[0].params.turnStartParams.model, "fixture-model");
   assert.equal(calls[0].params.turnStartParams.effort, "low");
 });
+
+test("steering includes a restorable message and uses the existing active turn protocol", async () => {
+  const { desktopSteerTurnParams } = await import("../lib/desktop-ipc-protocol.js");
+  const params = desktopSteerTurnParams("thread", input, "client-message", { text: "hello", cwd: "/fixture", now: 123 });
+  assert.equal(params.restoreMessage.id, params.clientUserMessageId);
+  assert.equal(params.restoreMessage.text, "hello");
+  assert.equal(params.restoreMessage.createdAt, 123);
+  assert.deepEqual(params.restoreMessage.context.commentAttachments, []);
+  assert.equal(params.restoreMessage.context.prompt, "hello");
+  assert.equal(params.conversationId, "thread");
+  assert.deepEqual(desktopRequestEnvelope({ detected: true, versions: { "thread-follower-steer-turn": 1 } }, "thread-follower-steer-turn", params), { version: 1 });
+});

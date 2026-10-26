@@ -12,9 +12,12 @@ function fixture() {
   const els = { composerInput: { value: "" }, messageList: {} };
   const noop = () => {};
   const context = {
+    syncUserInputDialog() {},
+    userInputDialog: { reset() {} },
     state, els, filePicker: { close: noop }, closePluginMentionMenu: noop, closeSkillMentionMenu: noop,
     autoResizeComposerInput: noop, clearDraftThread: noop, renderSubagents: noop,
     initProjectPreference: noop, hasActiveDraft: () => false,
+    closeContextPanel: noop, renderContextUsage: noop,
     clearSelectedPlugins: noop, clearSelectedSkills: noop, t: (key) => key, escapeHtml: (value) => value
   };
   return { state, input: els.composerInput, ...vm.runInNewContext(`${selection}\n${home}\n({ selectComposerThread, applyHomeContext })`, context) };

@@ -7,6 +7,11 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
   let columns = [];
   let roots = [];
   let root = 0;
+  let press = null;
+  const cancelPress = () => {
+    if (press) clearTimeout(press.timer);
+    press = null;
+  };
   const node = (tag, className, text) => {
     const element = document.createElement(tag);
     element.className = className;
@@ -20,6 +25,7 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
     return element;
   };
   const close = () => {
+    cancelPress();
     requestId++;
     panel.hidden = true;
     panel.replaceChildren();
@@ -40,6 +46,7 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
     button.querySelector(".plugin-picker-label").textContent = t("filePickerLabel");
   };
   const render = () => {
+    cancelPress();
     const previousStrip = panel.querySelector(".file-columns");
     const horizontal = previousStrip?.scrollLeft || 0;
     const scrolls = [...panel.querySelectorAll(".file-column")].map((column) => column.scrollTop);
@@ -50,6 +57,7 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
     dismiss.setAttribute("aria-label", t("fileClose"));
     header.append(title, dismiss);
     panel.append(header);
+    panel.append(node("p", "file-picker-hint", t("fileFolderHint")));
     if (roots.length > 1) {
       const select = node("select", "file-root-select");
       select.setAttribute("aria-label", t("fileRoot"));
@@ -90,14 +98,19 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
       } else {
         if (!column.entries.length) list.append(node("p", "file-picker-state", t("fileEmpty")));
         column.entries.forEach((entry) => {
+          let longPressed = false;
+          const selectPath = () => {
+            if (JSON.stringify(getContext()) !== contextKey || input.disabled) { close(); return; }
+            input.insertText(entry.absolutePath, ...selection);
+            close();
+          };
           const row = control("", () => {
+            if (longPressed) return;
             if (entry.directory) {
               column.selected = entry.path;
               void load(entry.path, index + 1);
             } else {
-              if (JSON.stringify(getContext()) !== contextKey || input.disabled) { close(); return; }
-              input.insertText(entry.absolutePath, ...selection);
-              close();
+              selectPath();
             }
           }, "file-entry");
           row.title = entry.absolutePath;
@@ -107,8 +120,24 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
           icon.setAttribute("aria-hidden", "true");
           row.append(icon, node("span", "file-entry-name", entry.name));
           if (entry.directory) row.append(node("span", "file-entry-arrow", "›"));
+          if (entry.directory) {
+            row.classList.add("file-directory");
+            row.addEventListener("pointerdown", (event) => {
+              cancelPress();
+              if (event.button !== 0 || event.isPrimary === false) return;
+              press = { pointerId: event.pointerId, x: event.clientX, y: event.clientY,
+                timer: setTimeout(() => {
+                  longPressed = true;
+                  selectPath();
+                }, 500) };
+            });
+            row.addEventListener("contextmenu", (event) => { event.preventDefault(); });
+          }
           row.addEventListener("keydown", (event) => {
-            if (event.key === "ArrowRight" && entry.directory) {
+            if (event.key === "Enter" && event.shiftKey && entry.directory) {
+              event.preventDefault();
+              selectPath();
+            } else if (event.key === "ArrowRight" && entry.directory) {
               event.preventDefault();
               column.selected = entry.path;
               void load(entry.path, index + 1, true);
@@ -164,6 +193,12 @@ export function installFilePicker({ button, panel, input, fetchJson, getContext,
     reveal();
     if (focus) panel.querySelectorAll(".file-column")[depth]?.querySelector("button")?.focus();
   };
+  document.addEventListener("pointermove", (event) => {
+    if (press && event.pointerId === press.pointerId && Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10) cancelPress();
+  });
+  document.addEventListener("pointerup", cancelPress);
+  document.addEventListener("pointercancel", cancelPress);
+  panel.addEventListener("scroll", cancelPress, true);
   // Save the caret before the button takes focus (also covers touch and keyboard).
   button.addEventListener("pointerdown", () => { selection = [input.selectionStart, input.selectionEnd]; });
   button.addEventListener("click", () => {

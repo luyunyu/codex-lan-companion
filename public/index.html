@@ -187,15 +187,18 @@
               <span id="accountName" class="account-name">Codex</span>
               <span id="accountPlan" class="account-plan">-</span>
             </button>
+            <button id="contextSummary" class="account-summary context-summary" type="button" aria-controls="contextPanel" aria-expanded="false">上下文 —</button>
             <button id="modelRetry" class="model-retry" type="button" hidden></button>
             <label><span id="modelLabel">模型</span><select id="modelSelect" disabled></select></label>
             <label><span id="effortLabel">推理强度</span><select id="effortSelect" disabled></select></label>
           </div>
           <span id="sendStatus" class="send-status" aria-live="polite"></span>
           <div id="accountPanel" class="account-panel" hidden></div>
+          <div id="contextPanel" class="account-panel context-panel" role="region" hidden></div>
         </form>
       </section>
     </main>
+    <dialog id="userInputDialog" class="user-input-dialog" aria-labelledby="userInputTitle"></dialog>
     <script src="/app.js" type="module"></script>
   </body>
 </html>
