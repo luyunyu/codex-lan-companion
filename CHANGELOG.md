@@ -1,8 +1,22 @@
 # Changelog
 
-## Unreleased — 2026-10-27
+## Unreleased — 2026-11-01
 
-Validation: syntax checks pass; 155 automated tests pass and 2 opt-in CLI integration tests are skipped. Browser and live Desktop integration checks were not repeated for this update.
+- Refresh both READMEs with the fork feature summary, recent fixes, macOS server support scope and task ownership implications when restarting.
+
+- Match Desktop subagent names by formatting the last non-root `agent_path` segment before falling back to the nickname, including archived children and session-header fallbacks.
+
+Validation (2026-11-01): syntax checks pass; 174 of 176 tests pass and 2 opt-in CLI integration tests are skipped. Earlier development sessions validated installed-CLI integration and native Desktop title generation locally; these checks and browser validation were not repeated for this update.
+
+- Recover paginated Desktop conversation history across multiple rollout files and date directories, preserving bounded reads and stable cursors when the latest segment grows. Verify session metadata before joining segments.
+
+- Leave App Server-created conversations unnamed and announce them only after their first-message preview is readable, allowing Desktop to generate titles through its existing discovery flow. Bound preview verification, handle temporarily unreadable lazy threads, and preserve accepted sends without retrying the message or issuing a companion-owned title-generation request.
+
+- Render question replies in chat as readable question/answer pairs with preserved custom text and line breaks, hiding protocol JSON and IDs without changing stored messages or reply matching.
+
+- Keep the latest unanswered async questions after final output and normal turn completion. Late answers start a follow-up turn; answered, dismissed, canceled and earlier-turn requests remain filtered.
+
+- Preserve unchanged project option nodes and avoid redundant selection assignments during thread refreshes, preventing background polling from repeatedly rebuilding mobile native project pickers.
 
 - Follow the system light/dark appearance in the main UI, including live changes, messages, composer controls and pickers.
 

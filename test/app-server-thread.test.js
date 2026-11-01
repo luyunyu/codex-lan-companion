@@ -12,12 +12,13 @@ import { AppServerThreadClient, createAppServerThread } from "../lib/app-server-
 const threadId = "01234567-1234-1234-1234-0123456789ab";
 const options = { cli: "/mock/codex", home: "/account/home", cwd: "/repo", workspaceRoots: ["/repo", "/shared"], projectId: "project-id", title: "测试项目" };
 
-function fixture({ changeResult = () => {}, respond = true, malformed = false, rejectMethod = "" } = {}) {
+function fixture({ changeResult = () => {}, respond = true, malformed = false, rejectMethod = "", readPreviews = ["First message"], completeBeforePreview = false } = {}) {
   const requests = [];
   const child = new EventEmitter();
   child.stdout = new PassThrough();
   child.stderr = new PassThrough();
   let launch;
+  let reads = 0;
   let closed = false;
   const close = () => {
     if (closed) return;
@@ -37,7 +38,11 @@ function fixture({ changeResult = () => {}, respond = true, malformed = false, r
         changeResult(result);
       }
       if (request.method === "turn/start") result = { turn: { id: "test-turn" } };
-      const response = request.method === rejectMethod
+      if (request.method === "thread/read") {
+        if (completeBeforePreview && reads === 0) child.stdout.write(`${JSON.stringify({ method: "turn/completed", params: { threadId, turn: { id: "test-turn", status: "completed" } } })}\n`);
+        result = { thread: { id: threadId, name: null, preview: readPreviews[Math.min(reads++, readPreviews.length - 1)] } };
+      }
+      const response = request.method === rejectMethod || (request.method === "thread/read" && result.thread.preview == null)
         ? { id: request.id, error: { message: "project unavailable" } }
         : { id: request.id, result };
       const bytes = Buffer.from(`${JSON.stringify({ method: "thread/started", params: { thread: { id: "unrelated" } } })}\n${JSON.stringify(response)}\n`);
@@ -135,6 +140,50 @@ test("background turns stay connected, route approvals and interrupt, then close
     assert.equal(mock.closed, true);
     assert.equal(mock.requests.filter((request) => request.method === "turn/start").length, 1);
   } finally { await client.close(); }
+});
+
+test("unnamed first turns wait for a readable preview without renaming, resuming or sending twice", async () => {
+  const mock = fixture({ readPreviews: [null, "", "  ", "First message"] });
+  const client = new AppServerThreadClient({ ...options, ...mock });
+  try {
+    await client.createThread({ ...options, title: undefined });
+    const result = await client.startFirstTurn(threadId, [{ type: "text", text: "First message" }], { model: "fixture-model", effort: "low" });
+    assert.equal(result.firstMessagePersisted, true);
+    assert.equal(result.turn.id, "test-turn");
+    assert.equal(mock.requests.filter((request) => request.method === "thread/read").length, 4);
+    assert.equal(mock.requests.filter((request) => request.method === "turn/start").length, 1);
+    assert.equal(mock.requests.some((request) => ["thread/name/set", "thread/resume"].includes(request.method)), false);
+    assert.equal(mock.requests.find((request) => request.method === "turn/start").params.effort, "low");
+    assert.ok(mock.requests.filter((request) => request.method === "thread/read").every((request) => request.params.includeTurns === false));
+  } finally { await client.close(); }
+});
+
+test("fast first turns release the writer only after their delayed preview has been checked", async () => {
+  const mock = fixture({ readPreviews: ["", "First message"], completeBeforePreview: true });
+  const client = new AppServerThreadClient({ ...options, ...mock });
+  await client.createThread({ ...options, title: undefined });
+  const result = await client.startFirstTurn(threadId, [{ type: "text", text: "First message" }]);
+  assert.equal(result.firstMessagePersisted, true);
+  await client.exited;
+  assert.equal(mock.closed, true);
+  assert.equal(client.pendingThreadPreviews.size, 0);
+});
+
+test("preview errors and missing previews preserve the accepted first turn and bound verification", async () => {
+  for (const config of [{ rejectMethod: "thread/read" }, { readPreviews: [""] }]) {
+    const mock = fixture(config);
+    const client = new AppServerThreadClient({ ...options, ...mock });
+    try {
+      await client.createThread({ ...options, title: undefined });
+      client.timeoutMs = 30;
+      const result = await client.startFirstTurn(threadId, [{ type: "text", text: "First message" }]);
+      assert.equal(result.firstMessagePersisted, false);
+      assert.equal(result.turn.id, "test-turn");
+      assert.equal(mock.requests.filter((request) => request.method === "turn/start").length, 1);
+      assert.equal(client.pendingThreadPreviews.size, 0);
+      assert.equal(mock.closed, false);
+    } finally { await client.close(); }
+  }
 });
 
 // Opt-in integration uses a disposable CODEX_HOME, without credentials or model requests.

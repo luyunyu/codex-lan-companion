@@ -7,7 +7,7 @@ const source = await fs.readFile(new URL("../server.js", import.meta.url), "utf8
 const appSource = await fs.readFile(new URL("../public/app.js", import.meta.url), "utf8");
 const fallback = source.slice(source.indexOf("async function startNewCodexThreadViaAppServer("), source.indexOf("\nasync function openCodexUrl("));
 
-function fixture({ turnError, switchHomeAfterCreate = false, createError } = {}) {
+function fixture({ turnError, switchHomeAfterCreate = false, createError, previewReady = true, beforePreview = async () => {} } = {}) {
   const calls = [];
   let home = "/account";
   let finish;
@@ -28,10 +28,11 @@ function fixture({ turnError, switchHomeAfterCreate = false, createError } = {})
         if (switchHomeAfterCreate) home = "/other";
         return { threadId: "new-thread" };
       },
-      startTurn: async (id, input) => {
+      startFirstTurn: async (id, input) => {
         calls.push(["turn", id, input]);
         if (turnError) throw new Error(turnError);
-        return { turn: { id: "first-turn" } };
+        await beforePreview();
+        return { turn: { id: "first-turn" }, firstMessagePersisted: previewReady };
       }
     })
   };
@@ -41,11 +42,12 @@ function fixture({ turnError, switchHomeAfterCreate = false, createError } = {})
 test("project creation sends exactly one first turn silently without Desktop navigation or owner discovery", async () => {
   const { start, calls, context, finish } = fixture();
   const result = await start("First message", { id: "project", rootPaths: ["/repo", "/shared"] }, "/account");
-  assert.deepEqual(calls.map(([name]) => name), ["create", "notify", "turn"]);
+  assert.deepEqual(calls.map(([name]) => name), ["create", "turn", "notify"]);
   assert.equal(calls[0][1].cwd, "/repo");
   assert.deepEqual(calls[0][1].workspaceRoots, ["/repo", "/shared"]);
   assert.equal(calls[0][1].projectId, "project");
-  assert.deepEqual(calls[2], ["turn", "new-thread", [{ type: "text", text: "First message" }]]);
+  assert.equal(Object.hasOwn(calls[0][1], "title"), false);
+  assert.deepEqual(calls[1], ["turn", "new-thread", [{ type: "text", text: "First message" }]]);
   assert.equal(result.turnId, "first-turn");
   assert.equal(result.source, "app-server");
   assert.equal(context.threadsCache, null);
@@ -54,6 +56,27 @@ test("project creation sends exactly one first turn silently without Desktop nav
   await Promise.resolve();
   assert.deepEqual(calls.at(-1), ["notify", "new-thread"]);
   assert.equal(calls.filter(([kind]) => kind === "notify").length, 2);
+});
+
+test("Desktop is notified only after the first message preview is readable", async () => {
+  let release;
+  const preview = new Promise((resolve) => { release = resolve; });
+  const { start, calls } = fixture({ beforePreview: () => preview });
+  const sending = start("First message");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls.map(([name]) => name), ["create", "turn"]);
+  release();
+  await sending;
+  assert.deepEqual(calls.map(([name]) => name), ["create", "turn", "notify"]);
+});
+
+test("an accepted send without a readable preview never announces an empty thread, including on exit", async () => {
+  const { start, calls, finish } = fixture({ previewReady: false });
+  const result = await start("First message");
+  assert.equal(result.turnId, "first-turn");
+  finish();
+  await Promise.resolve();
+  assert.deepEqual(calls.map(([name]) => name), ["create", "turn"]);
 });
 
 test("default directory and synthetic legacy roots retain their directory without fake project IDs", async () => {
@@ -73,7 +96,7 @@ test("partial failure exposes the existing thread without retrying creation or t
     assert.match(error.message, /Check its messages/);
     return true;
   });
-  assert.deepEqual(calls.map(([name]) => name), ["create", "notify", "turn"]);
+  assert.deepEqual(calls.map(([name]) => name), ["create", "turn"]);
 });
 
 test("account changes prevent delivery and hide old-account thread IDs", async () => {

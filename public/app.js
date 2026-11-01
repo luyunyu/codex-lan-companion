@@ -1,5 +1,5 @@
 import { installUserInputDialog } from "./user-input-dialog.js";
-import { renderMarkdown, isVisibleMessage, assistantMessageStyle } from "./message-format.js";
+import { renderMarkdown, isVisibleMessage, assistantMessageStyle, renderUserInputReply } from "./message-format.js";
 import { mergeMessageHistory } from "./message-history.js";
 import { installInlineComposer } from "./inline-composer.js";
 import { composerMarkdown } from "./mention-format.js";
@@ -208,6 +208,7 @@ const I18N = {
     inputSending: "正在提交…",
     inputFailed: "回答提交失败：{message}",
     inputOpen: "选择 / 回答",
+    inputReplyLabel: "问题回复",
     runningInputHint: "可补充消息；输入为空时按钮用于停止任务",
     approvalYes: "是",
     approvalNo: "否",
@@ -369,6 +370,7 @@ const I18N = {
     inputSending: "Submitting…",
     inputFailed: "Answer failed: {message}",
     inputOpen: "Choose / answer",
+    inputReplyLabel: "Question reply",
     runningInputHint: "Add a message; the button stops the task when the input is empty",
     approvalYes: "Yes",
     approvalNo: "No",
@@ -1034,20 +1036,39 @@ function visibleThreads() {
   return matchesDraft ? [draft, ...state.threads] : state.threads;
 }
 
-function renderProjectControls() {
-  const options = state.projects.map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
-  els.projectFilter.innerHTML = `<option value="">${escapeHtml(t("allProjects"))}</option><option value="__none__">${escapeHtml(t("noProject"))}</option>${options}`;
-  if (state.projectFilter && state.projectFilter !== "__none__" && !state.projects.some((project) => project.id === state.projectFilter)) {
-    els.projectFilter.innerHTML += `<option value="${escapeHtml(state.projectFilter)}">${escapeHtml(t("unavailableProject"))}</option>`;
+function syncProjectSelect(select, options, value) {
+  // Replacing unchanged options can disturb an open native picker on mobile.
+  const changed = select.options.length !== options.length || options.some((option, index) =>
+    select.options[index].value !== option.value || select.options[index].textContent !== option.label);
+  if (changed) {
+    select.replaceChildren(...options.map(({ value, label }) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      return option;
+    }));
   }
-  els.projectFilter.value = state.projectFilter;
+  if (select.value !== value) select.value = value;
+}
+
+function renderProjectControls() {
+  const options = [
+    { value: "", label: t("allProjects") },
+    { value: "__none__", label: t("noProject") },
+    ...state.projects.map((project) => ({ value: project.id, label: project.name }))
+  ];
+  if (state.projectFilter && state.projectFilter !== "__none__" && !state.projects.some((project) => project.id === state.projectFilter)) {
+    options.push({ value: state.projectFilter, label: t("unavailableProject") });
+  }
+  syncProjectSelect(els.projectFilter, options, state.projectFilter);
   els.projectFilter.setAttribute("aria-label", t("project"));
   els.draftProjectField.hidden = state.selectedId !== DRAFT_THREAD_ID;
   document.querySelector("#draftProjectLabel").textContent = t("project");
-  els.draftProjectSelect.innerHTML = `<option value="">${escapeHtml(t("defaultDirectory"))}</option>` + state.projects
-    .filter((project) => project.rootPaths.length)
-    .map((project) => `<option value="${escapeHtml(project.id)}">${escapeHtml(project.name)}</option>`).join("");
-  els.draftProjectSelect.value = state.draftThread?.projectId || "";
+  syncProjectSelect(els.draftProjectSelect, [
+    { value: "", label: t("defaultDirectory") },
+    ...state.projects.filter((project) => project.rootPaths.length)
+      .map((project) => ({ value: project.id, label: project.name }))
+  ], state.draftThread?.projectId || "");
   els.draftProjectSelect.disabled = state.composerBusy || !state.config?.allowWrite;
 }
 
@@ -1320,7 +1341,7 @@ function renderMessages(data) {
           <div class="bubble">
             ${assistantStyle ? `<div class="message-heading"><span class="message-phase">${escapeHtml(t(assistantStyle === "reasoning" ? "reasoningLabel" : assistantStyle === "progress" ? "progressLabel" : message.phase === "final_answer" ? "finalAnswerLabel" : "answerLabel"))}</span>${metaTop ? `<span class="message-meta">${escapeHtml(metaTop)}</span>` : ""}</div>` : metaTop && message.role !== "user" ? `<div class="message-meta message-meta-top">${escapeHtml(metaTop)}</div>` : ""}
             ${title}
-            ${message.content && !noticeCollapsed ? renderMarkdownLite(message.content) : ""}
+            ${message.content && !noticeCollapsed ? renderUserInputReply(message, t("inputReplyLabel")) || renderMarkdownLite(message.content) : ""}
             ${!noticeCollapsed ? renderMessageImages(message) : ""}
             ${renderApprovalActions(message)}
             ${message.role === "user"

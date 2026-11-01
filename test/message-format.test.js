@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import { test } from "node:test";
 import vm from "node:vm";
-import { isVisibleMessage, renderMarkdown, assistantMessageStyle } from "../public/message-format.js";
+import { isVisibleMessage, renderMarkdown, assistantMessageStyle, renderUserInputReply } from "../public/message-format.js";
+import { userInputReplyText, answeredUserInputIds } from "../lib/user-input-requests.js";
 import { stripInjectedUserContext } from "../lib/user-message-content.js";
 
 test("Markdown renders headings, nested lists, quotes, tables and inline formatting", () => {
@@ -72,4 +73,43 @@ test("response parsing drops internal roles before reading their contents", asyn
   }
   assert.equal(parse(null, { type: "message", role: "assistant", content: "reply" }).content, "reply");
   assert.equal(parse(null, { type: "message", role: "user", content: "prompt" }).content, "prompt");
+});
+
+test("question replies render readable question/answer pairs without changing transport content", () => {
+  const request = { questions: [{ id: "first-id", title: "How should progress be recorded?" }, { id: "second-id", title: "Any other constraints?" }] };
+  const content = userInputReplyText(request, { "first-id": "Optional registration\nAdd timestamps and keep old records.", "second-id": "No new required fields." });
+  const message = { role: "user", content };
+  const html = renderUserInputReply(message, "问题回复");
+  assert.match(html, /<dt>How should progress be recorded\?<\/dt>/);
+  assert.match(html, /<dd>Optional registration\nAdd timestamps and keep old records\.<\/dd>/);
+  assert.match(html, /<dt>Any other constraints\?<\/dt>/);
+  assert.match(html, /No new required fields\./);
+  assert.doesNotMatch(html, /send_user_message_question_reply|questionItemId|first-id|second-id/);
+  assert.equal(message.content, content);
+  assert.deepEqual(answeredUserInputIds(message.content), ["first-id", "second-id"]);
+  const single = { questionItemId: "native-id", question: "Choose", answer: "Custom answer" };
+  assert.match(renderUserInputReply({ role: "user", content: `\r\n<send_user_message_question_reply>\r\n${JSON.stringify(single)}\r\n</send_user_message_question_reply>\r\n` }, "Question reply"), /<dd>Custom answer<\/dd>/);
+});
+
+test("question replies escape markup and preserve literal custom text and line breaks", () => {
+  const request = { questions: [{ id: "fixture", title: "<img src=x onerror=evil()> & <script>" }] };
+  const answer = "<script>alert(1)</script>\n**literal** & [click](javascript:evil())\n{\"keep\":\"custom JSON\"}";
+  const html = renderUserInputReply({ role: "user", content: userInputReplyText(request, { fixture: answer }) }, "<Reply>");
+  assert.match(html, /&lt;img src=x onerror=evil\(\)&gt;/);
+  assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+  assert.match(html, /\n\*\*literal\*\* &amp;/);
+  assert.match(html, /custom JSON/);
+  assert.doesNotMatch(html, /<script|<img|<a\s|<strong>/);
+});
+
+test("ordinary JSON, quoted envelopes, malformed replies and assistant examples retain normal rendering", () => {
+  const reply = { questionItemId: "fixture", question: "Choose", answer: "Small" };
+  const envelope = (value) => `<send_user_message_question_reply>\n${value}\n</send_user_message_question_reply>`;
+  for (const content of ["Normal prompt", JSON.stringify(reply), `\`\`\`json\n${envelope(JSON.stringify(reply))}\n\`\`\``,
+    envelope("malformed"), envelope("null"), envelope("[]"), envelope(JSON.stringify([{ question: "Missing id", answer: "Small" }])),
+    envelope(JSON.stringify([reply, { questionItemId: "invalid", question: "Missing answer" }])), `${envelope(JSON.stringify(reply))}\nAdditional ordinary text`]) {
+    assert.equal(renderUserInputReply({ role: "user", content }, "Reply"), "");
+    assert.equal(typeof renderMarkdown(content), "string");
+  }
+  assert.equal(renderUserInputReply({ role: "assistant", content: envelope(JSON.stringify(reply)) }, "Reply"), "");
 });

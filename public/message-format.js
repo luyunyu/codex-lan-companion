@@ -11,6 +11,26 @@ export function isVisibleMessage(message) {
   return ["user", "assistant", "interaction", "notice"].includes(message?.role);
 }
 
+// Keep the protocol envelope in message.content for reply matching and history;
+// only its presentation becomes a readable list of questions and answers.
+export function renderUserInputReply(message, label) {
+  if (message?.role !== "user" || typeof message.content !== "string") return "";
+  const envelope = message.content.trim().match(/^<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>$/);
+  if (!envelope) return "";
+  let replies;
+  try {
+    const value = JSON.parse(envelope[1]);
+    replies = Array.isArray(value) ? value : [value];
+  } catch {
+    return "";
+  }
+  if (!replies.length || !replies.every((reply) => reply && typeof reply.questionItemId === "string" && reply.questionItemId
+    && typeof reply.question === "string" && reply.question.trim() && typeof reply.answer === "string")) return "";
+  return `<div class="user-input-reply"><div class="user-input-reply-label">${escapeHtml(label)}</div><dl class="user-input-reply-list">${replies.map((reply) =>
+    `<div class="user-input-reply-item"><dt>${escapeHtml(reply.question)}</dt><dd>${escapeHtml(reply.answer)}</dd></div>`
+  ).join("")}</dl></div>`;
+}
+
 export function assistantMessageStyle(message) {
   if (message?.role !== "assistant") return "";
   if (message.kind === "reasoning" || message.phase === "analysis") return "reasoning";

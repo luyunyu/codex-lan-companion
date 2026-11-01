@@ -1,4 +1,4 @@
-import { userInputRequest, answeredUserInputIds, userInputResolved, validateUserInputAnswers, userInputReplyText, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds } from "../lib/user-input-requests.js";
+import { userInputRequest, answeredUserInputIds, userInputResolved, validateUserInputAnswers, userInputReplyText, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds, desktopAsyncInputReplyMode } from "../lib/user-input-requests.js";
 import { desktopUserInput } from "../lib/desktop-user-input.js";
 import { desktopSteerTurnParams } from "../lib/desktop-ipc-protocol.js";
 import assert from "node:assert/strict";
@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import vm from "node:vm";
-import { readRolloutWindow } from "../lib/rollout-history.js";
+import { readRolloutWindow, readRolloutHistoryWindow, rolloutHistoryFiles } from "../lib/rollout-history.js";
 import { stripInjectedUserContext } from "../lib/user-message-content.js";
 import { mergeMessageHistory } from "../public/message-history.js";
 import { ThreadStatusReader } from "../lib/thread-status.js";
@@ -57,7 +57,7 @@ test("filtered-out byte windows still advance their cursors", async (t) => {
 const source = await fs.readFile(new URL("../server.js", import.meta.url), "utf8");
 function serverFixture(file, overrides = {}) {
   const context = {
-    fs, existsSync, readRolloutWindow, stripInjectedUserContext, userInputRequest, answeredUserInputIds, userInputResolved, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds,
+    fs, existsSync, readRolloutHistoryWindow, rolloutHistoryFiles, stripInjectedUserContext, userInputRequest, answeredUserInputIds, userInputResolved, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds, desktopAsyncInputReplyMode,
     userInputSubmissions: new Set(), userInputInFlight: new Set(),
     validateUserInputAnswers, userInputReplyText, desktopUserInput, desktopSteerTurnParams,
     DEFAULT_MESSAGE_LIMIT: 40, MAX_MESSAGE_LIMIT: 1000,
@@ -304,7 +304,7 @@ test("approvals and important errors do not reduce the chat budget", async (t) =
   assert.equal(result.nextBefore, 1000);
 });
 
-test("async questions stay pending after tool completion and disappear after a tagged reply or turn completion", async (t) => {
+test("async questions survive normal completion and disappear after an answer or interruption", async (t) => {
   const now = new Date().toISOString();
   const call = { type: "function_call", name: "request_user_input_async", id: "fixture-question", call_id: "fixture-call", arguments: JSON.stringify({ questions: [{ title: "Choose scope", options: ["Small", "Large"] }] }) };
   const question = userInputRequest(call).questions[0];
@@ -319,6 +319,10 @@ test("async questions stay pending after tool completion and disappear after a t
   page = await serverFixture(file).getMessages("fixture");
   assert.equal(page.messages.some((message) => message.inputRequest), false);
   await fs.writeFile(file, initial + line("event_msg", { type: "task_complete", turn_id: "turn" }));
+  page = await serverFixture(file).getMessages("fixture");
+  assert.equal(page.status.thinking, false);
+  assert.equal(page.messages.find((message) => message.inputRequest).inputReplyMode, "follow-up");
+  await fs.writeFile(file, initial + line("event_msg", { type: "turn_aborted", turn_id: "turn" }));
   page = await serverFixture(file).getMessages("fixture");
   assert.equal(page.messages.some((message) => message.inputRequest), false);
 });
@@ -393,7 +397,8 @@ test("IPC history cannot revive answered questions or questions from previous tu
   for (const currentRunning of [false, true]) {
     const { file } = await fixture(t, line("event_msg", { type: "task_started", turn_id: "old" }) + line("response_item", call)
       + line("event_msg", { type: "task_complete", turn_id: "old" })
-      + (currentRunning ? line("event_msg", { type: "task_started", turn_id: "current" }) : ""));
+      + line("event_msg", { type: "task_started", turn_id: "current" })
+      + (currentRunning ? "" : line("event_msg", { type: "task_complete", turn_id: "current" })));
     const api = serverFixture(file, { ALLOW_WRITE: true, refreshCodexHomeContext: async () => {}, codexIpcClient: { events: [], getRecentInteractionMessages: () => [ipcMessage], getRecentNoticeMessages: () => [] } });
     const page = await api.getMessages("fixture");
     assert.equal(page.messages.some((message) => message.inputRequest), false);
@@ -434,6 +439,10 @@ test("a current unanswered question survives IPC deduplication while a Desktop r
   assert.equal(page.messages.find((message) => message.inputRequest).requestId, call.call_id);
   assert.equal(page.messages.find((message) => message.inputRequest).turnId, "current");
   assert.equal(page.status.interactionRequired, true);
+  await fs.writeFile(file, initial + line("event_msg", { type: "task_complete", turn_id: "current" }));
+  const completed = await serverFixture(file, { codexIpcClient: ipc }).getMessages("fixture");
+  assert.equal(completed.status.thinking, false);
+  assert.equal(completed.messages.find((message) => message.inputRequest).inputReplyMode, "follow-up", "IPC deduplication preserves the post-completion delivery mode");
   await fs.writeFile(file, initial + line("event_msg", { type: "user_message", message: userInputReplyText(inputRequest, { [inputRequest.questions[0].id]: "Small" }) }));
   const after = await serverFixture(file, { codexIpcClient: ipc }).getMessages("fixture");
   assert.equal(after.messages.some((message) => message.inputRequest), false);
@@ -469,4 +478,98 @@ test("legacy Companion receipts still resolve questions and explicit older turn 
     assert.equal(page.status.thinking, true);
     assert.equal(page.messages.some((message) => message.inputRequest), false);
   }
+});
+
+test("final output and normal completion retain latest questions across fresh loads and route late answers to a follow-up", async (t) => {
+  const timestamp = new Date().toISOString();
+  const line = (type, payload) => JSON.stringify({ timestamp, type, payload }) + "\n";
+  const call = { type: "function_call", name: "request_user_input_async", id: "fc-final", call_id: "call-final", arguments: JSON.stringify({ questions: [{ title: "Confirm next steps", options: ["Continue"] }] }) };
+  const initial = line("event_msg", { type: "task_started", turn_id: "latest" }) + line("response_item", call)
+    + line("response_item", { type: "message", role: "assistant", phase: "final_answer", content: [{ type: "output_text", text: "The work is ready; please confirm next steps." }] });
+  const { file } = await fixture(t, initial);
+  let page = await serverFixture(file).getMessages("fixture");
+  assert.equal(page.status.thinking, true);
+  assert.equal(page.messages.find((message) => message.inputRequest).inputReplyMode, "steer");
+  const finished = initial + line("event_msg", { type: "task_complete", turn_id: "latest" });
+  await fs.writeFile(file, finished);
+  const calls = [];
+  const api = serverFixture(file, { ALLOW_WRITE: true, refreshCodexHomeContext: async () => {}, sendToCodex: async (...args) => calls.push(args),
+    getCodexIpcClient: () => { throw new Error("A completed turn must not be steered"); } });
+  page = await api.getMessages("fixture");
+  assert.equal(page.status.thinking, false);
+  assert.equal(page.status.interactionRequired, true);
+  const pending = page.messages.find((message) => message.inputRequest);
+  assert.equal(pending.inputReplyMode, "follow-up");
+  const values = { [pending.inputRequest.questions[0].id]: "Continue with additions" };
+  await api.respondToUserInput({ threadId: "fixture", requestId: pending.requestId, answers: values });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], "fixture");
+  assert.deepEqual(answeredUserInputIds(calls[0][0]), pending.inputRequest.questions.map((question) => question.id));
+  assert.equal((await api.getMessages("fixture")).status.interactionRequired, false);
+  await fs.writeFile(file, finished + line("event_msg", { type: "user_message", message: calls[0][0] }));
+  assert.equal((await serverFixture(file).getMessages("fixture")).status.interactionRequired, false, "Desktop receipts work without in-memory submission state");
+  await fs.writeFile(file, finished + line("event_msg", { type: "task_started", turn_id: "newer" }));
+  assert.equal((await serverFixture(file).getMessages("fixture")).status.interactionRequired, false, "a new turn retires earlier unanswered questions");
+});
+
+test("latest completed Desktop snapshot keeps unanswered questions when rollout is unavailable", async () => {
+  const question = { type: "agentMessage", id: "latest-call", completed: true, questions: [{ title: "Next step", options: [] }] };
+  const state = { turns: [{ turnId: "latest", status: "completed", items: [question] }], requests: [] };
+  const message = { role: "interaction", requestId: question.id, inputRequest: userInputRequest(question), content: "Next step", canRespond: true, requiresDesktopAction: true, source: "desktop-ipc" };
+  const ipc = { events: [{ message: { params: { conversationId: "fixture", change: { type: "snapshot", revision: 1, conversationState: state } } } }],
+    conversationIdFromMessage: () => "fixture", getRecentInteractionMessages: () => [message], getRecentNoticeMessages: () => [] };
+  const page = await serverFixture(null, { codexIpcClient: ipc }).getMessages("fixture");
+  assert.equal(page.status.thinking, false);
+  assert.equal(page.status.interactionRequired, true);
+  assert.equal(page.messages[0].inputReplyMode, "follow-up");
+});
+
+test("bounded windows keep completed-turn questions when metadata proves their turn without the start record", async (t) => {
+  const timestamp = new Date().toISOString();
+  const line = (type, payload) => JSON.stringify({ timestamp, type, payload }) + "\n";
+  const call = { type: "function_call", name: "request_user_input_async", id: "fc-tail", call_id: "call-tail", internal_chat_message_metadata_passthrough: { turn_id: "latest" }, arguments: JSON.stringify({ questions: [{ title: "Next steps", options: [] }] }) };
+  const text = line("event_msg", { type: "task_started", turn_id: "latest" }) + line("event_msg", { type: "agent_message", message: "x".repeat(50000) })
+    + line("event_msg", { type: "ignored", padding: "x".repeat(10000) }) + line("response_item", call)
+    + line("event_msg", { type: "agent_message", message: "Final output" }).repeat(20) + line("event_msg", { type: "task_complete", turn_id: "latest" });
+  const { file } = await fixture(t, text);
+  const page = await serverFixture(file).getMessages("fixture", { limit: 20 });
+  assert.equal(page.partial, true);
+  assert.equal(page.status.thinking, false);
+  assert.equal(page.messages.find((message) => message.inputRequest).inputReplyMode, "follow-up");
+});
+
+
+test("paginated Desktop rollouts load older files across dates with stable history cursors", async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "lan-segments-"));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+  const id = "11111111-1111-7111-8111-111111111111";
+  const suffix = "22222222-2222-7222-8222-222222222222";
+  const header = (sessionId = id) => JSON.stringify({ type: "session_meta", payload: { id: sessionId, history_mode: "paginated" } });
+  const oldDir = path.join(dir, "sessions/2026/10/27");
+  const newDir = path.join(dir, "sessions/2026/10/28");
+  await fs.mkdir(oldDir, { recursive: true });
+  await fs.mkdir(newDir, { recursive: true });
+  const oldFile = path.join(oldDir, `rollout-2026-10-27T18-45-37-${id}.jsonl`);
+  const newFile = path.join(newDir, `rollout-2026-10-28T21-43-50-${id}_${suffix}.jsonl`);
+  await fs.writeFile(oldFile, [header(), ...Array.from({ length: 65 }, (_, i) => record(i, true))].join("\n") + "\n");
+  await fs.writeFile(newFile, [header(), record(65, true), record(66, true)].join("\n") + "\n");
+  // A matching filename is insufficient to import another session.
+  await fs.writeFile(path.join(oldDir, `rollout-2026-10-27T19-00-00-${id}_${suffix}.jsonl`), header(suffix) + "\n" + record(999, true));
+  const { getMessages } = serverFixture(newFile);
+  let page = await getMessages("fixture");
+  assert.equal(page.messages.length, 40);
+  assert.equal(page.messages.at(-1).content, "message 66 中文🙂");
+  assert.equal(page.hasMore, true);
+  const identity = page.historyFileId;
+  const seen = new Set(page.messages.map((message) => message.content));
+  const cursor = page.nextBefore;
+  await fs.appendFile(newFile, record(67, true) + "\n");
+  assert.equal((await getMessages("fixture")).historyFileId, identity);
+  page = await getMessages("fixture", { before: cursor });
+  for (const message of page.messages) seen.add(message.content);
+  assert.equal(page.hasMore, false);
+  assert.equal(seen.size, 67);
+  assert.ok(seen.has("message 0 中文🙂"));
+  await fs.appendFile(oldFile, "\n");
+  assert.notEqual((await getMessages("fixture")).historyFileId, identity);
 });

@@ -158,6 +158,9 @@ test("real CLI and authenticated API create and run silently with project instru
   }
   const read = await inspector.request("thread/read", { threadId: first.data.threadId, includeTurns: true });
   assert.equal(read.thread.projectId, project.project.id);
+  assert.equal(read.thread.name, null);
+  assert.equal(read.thread.preview, "Fixture prompt");
+  assert.equal(modelInputs.length, 1, "The companion must not generate a title with another model request");
   const firstRecord = JSON.parse((await fs.readFile(read.thread.path, "utf8")).split("\n")[0]);
   assert.equal(firstRecord.payload.originator, "codex_lan_companion");
   await inspector.close();

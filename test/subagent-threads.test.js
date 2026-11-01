@@ -26,6 +26,37 @@ test("subagent identity uses metadata, supports both representations and never g
   assert.deepEqual(childThreads(rows, null), []);
 });
 
+test("child names prefer Desktop-formatted agent paths and retain legacy fallbacks", () => {
+  const cases = [
+    ["/root/code_review", "Nickname", "Code review"],
+    [" /root/parent_task// API--review_v2 / ", "Nickname", "Api review v2"],
+    ["/root/parent/root/CHILD\tTask", "Nickname", "Child task"],
+    ["/root/中文_检查", "Nickname", "中文 检查"],
+    [undefined, " Legacy worker ", "Legacy worker"],
+    [null, "Nickname", "Nickname"],
+    ["", "Nickname", "Nickname"],
+    [" /root/ / ", "Nickname", "Nickname"],
+    ["/root/___--", "Nickname", "Nickname"],
+    [42, "Nickname", "Nickname"],
+    ["/root/task", "", "Task"],
+    [undefined, "", "Legacy title"]
+  ];
+  for (const [agentPath, nickname, title] of cases) {
+    const source = spawnSource("parent", nickname);
+    source.subagent.thread_spawn.agent_path = agentPath;
+    for (const threadSource of [source, JSON.stringify(source)]) {
+      const [child] = childThreads([{ id: "child", title: "Legacy title", threadSource, archived: true }], "parent");
+      assert.equal(child.title, title, JSON.stringify({ agentPath, nickname }));
+      assert.equal(child.agentPath, typeof agentPath === "string" ? agentPath : "");
+    }
+  }
+  const source = spawnSource("parent", "");
+  source.subagent.thread_spawn.agent_role = "worker";
+  assert.equal(childThreads([{ id: "child", title: "Untitled", source }], "parent")[0].title, "worker");
+  delete source.subagent.thread_spawn.agent_role;
+  assert.equal(childThreads([{ id: "child", title: "Untitled", source }], "parent")[0].title, "Subagent");
+});
+
 test("header fallback reads bounded metadata, ignores message bodies and invalidates replacement files", async (t) => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "companion-agent-"));
   t.after(() => fs.rm(directory, { recursive: true, force: true }));

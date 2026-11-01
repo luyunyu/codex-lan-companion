@@ -10,7 +10,7 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import qrcode from "qrcode-terminal";
 import { readDesktopIpcVersions, desktopRequestEnvelope, desktopStartTurnParams, desktopThreadAvailableBroadcast, desktopSteerTurnParams } from "./lib/desktop-ipc-protocol.js";
-import { userInputRequest, validateUserInputAnswers, userInputReplyText, answeredUserInputIds, userInputResolved, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds } from "./lib/user-input-requests.js";
+import { userInputRequest, validateUserInputAnswers, userInputReplyText, answeredUserInputIds, userInputResolved, userInputAnswered, desktopUserInputState, desktopPendingAsyncInputIds, desktopAsyncInputReplyMode } from "./lib/user-input-requests.js";
 import { desktopUserInput } from "./lib/desktop-user-input.js";
 import { readNativeSkills, assertAvailableSkillReferences } from "./lib/native-skills.js";
 import { AppServerThreadClient } from "./lib/app-server-thread.js";
@@ -20,7 +20,7 @@ import { projectCatalog, withThreadProjects, threadPage } from "./lib/thread-pro
 import { fileBrowserRoots, listProjectDirectory } from "./lib/project-files.js";
 import { ThreadStatusReader } from "./lib/thread-status.js";
 import { stripInjectedUserContext } from "./lib/user-message-content.js";
-import { readRolloutWindow } from "./lib/rollout-history.js";
+import { readRolloutHistoryWindow, rolloutHistoryFiles } from "./lib/rollout-history.js";
 import { subagentInfo, sidebarThreadPage, childThreads, SessionMetadataReader } from "./lib/subagent-threads.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2168,8 +2168,9 @@ function redactLargePayloads(value, depth = 0) {
 }
 
 function isInteractionPayload(payload) {
-  if (isApprovalDecisionPayload(payload) || payload?.completed === true) return false;
-  if (userInputRequest(payload)) return true;
+  const input = userInputRequest(payload);
+  if (isApprovalDecisionPayload(payload) || (payload?.completed === true && input?.mode !== "async")) return false;
+  if (input) return true;
   const toolArguments = parseMaybeJsonObject(payload?.arguments);
   const params = payload?.params || payload?.payload || {};
   if (
@@ -2419,6 +2420,8 @@ function preferredInteractionMessage(existing, candidate) {
   const display = String(candidate?.content || "").length < String(existing?.content || "").length ? candidate : existing;
   const live = candidateIsLive ? candidate : existingIsLive ? existing : null;
   if (!live) return display;
+  const inputReplyMode = existing.inputReplyMode === "follow-up" || candidate.inputReplyMode === "follow-up"
+    ? "follow-up" : existing.inputReplyMode || candidate.inputReplyMode;
   return {
     ...display,
     source: live.source,
@@ -2426,6 +2429,7 @@ function preferredInteractionMessage(existing, candidate) {
     approvalKind: live.approvalKind || display.approvalKind,
     canApprove: live.canApprove || display.canApprove,
     ...(live.inputRequest ? { inputRequest: live.inputRequest, canRespond: live.canRespond } : {}),
+    ...(inputReplyMode ? { inputReplyMode } : {}),
     requiresDesktopAction: Boolean(live.requiresDesktopAction || display.requiresDesktopAction),
     lineNumber: Math.min(existing.lineNumber || candidate.lineNumber || 0, candidate.lineNumber || existing.lineNumber || 0),
     timestamp: display.timestamp || live.timestamp
@@ -2750,6 +2754,7 @@ function createRolloutParseState(stat, nowMs) {
     contextUsage: null,
     lineNumber: 0,
     activeTurn: null,
+    latestTurn: null,
     openTurns: new Map(),
     lastEntryAtMs: Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : nowMs,
     assistantMessagesByTurn: new Map()
@@ -2786,9 +2791,11 @@ function parseRolloutLine(line, state, sourceOffset) {
       if (entry.payload?.type === "task_started") {
         const turn = {
           turnId: entry.payload.turn_id || null,
-          startedAtMs: Number(entry.payload.started_at) ? Number(entry.payload.started_at) * 1000 : Date.parse(entry.timestamp)
+          startedAtMs: Number(entry.payload.started_at) ? Number(entry.payload.started_at) * 1000 : Date.parse(entry.timestamp),
+          status: "inProgress"
         };
         state.activeTurn = turn;
+        state.latestTurn = turn;
         if (turn.turnId) state.openTurns.set(turn.turnId, turn);
         return;
       }
@@ -2802,7 +2809,10 @@ function parseRolloutLine(line, state, sourceOffset) {
           if (Number.isFinite(completedAtMs)) message.completedAtMs = completedAtMs;
         }
         if (turnId) state.openTurns.delete(turnId);
-        if (turnId && state.activeTurn?.turnId === turnId) state.activeTurn = null;
+        if (!state.latestTurn || state.latestTurn.turnId === turnId) {
+          state.latestTurn = { ...(state.latestTurn || { turnId, startedAtMs: null }), status: entry.payload.type === "task_complete" ? "completed" : "interrupted" };
+        }
+        if (state.activeTurn?.turnId === turnId) state.activeTurn = null;
         return;
       }
       const messageMeta = {
@@ -2870,15 +2880,18 @@ function rolloutResultFromState({ filePath, stat, nowMs, state, partial = false 
     : null;
   const activeTurnStale = Boolean(state.activeTurn && nowMs - activeTurnLastUpdatedAtMs > ACTIVE_TURN_STALE_MS);
   const visibleActiveTurn = activeTurnStale ? null : state.activeTurn;
+  const inputTurn = state.latestTurn?.status === "completed" ? state.latestTurn : visibleActiveTurn;
   for (const message of state.interactionMessages) {
     const input = message.inputRequest;
     const answered = input && (input.mode === "async"
       ? userInputAnswered(input, state.answeredInputIds)
       : state.answeredInputIds.has(input.callId));
-    const currentInputTurn = visibleActiveTurn && (message.turnId
-      ? message.turnId === visibleActiveTurn.turnId
-      : !visibleActiveTurn.turnId && message.turnStartedAtMs != null && message.turnStartedAtMs === visibleActiveTurn.startedAtMs);
-    message.requiresDesktopAction = Boolean(!answered && visibleActiveTurn && (input ? currentInputTurn : !message.turnId || message.turnId === visibleActiveTurn.turnId));
+    const targetTurn = input?.mode === "async" ? inputTurn : visibleActiveTurn;
+    const currentInputTurn = targetTurn && (message.turnId
+      ? message.turnId === targetTurn.turnId
+      : !targetTurn.turnId && message.turnStartedAtMs != null && message.turnStartedAtMs === targetTurn.startedAtMs);
+    message.requiresDesktopAction = Boolean(!answered && (input ? currentInputTurn : visibleActiveTurn && (!message.turnId || message.turnId === visibleActiveTurn.turnId)));
+    if (input?.mode === "async") message.inputReplyMode = inputTurn?.status === "completed" ? "follow-up" : "steer";
   }
   const reasoningMessages = state.reasoningEvents.length ? state.reasoningEvents : state.reasoningFallbacks;
   const pendingInteractions = state.interactionMessages.filter((message) => message.requiresDesktopAction);
@@ -2935,7 +2948,7 @@ async function parseRolloutTail(filePath, stat, limit, nowMs, before = null) {
   let window;
   let result;
   do {
-    window = await readRolloutWindow(filePath, { before: cursor, size: stat.size, maxBytes, mapLine: mapRolloutHistoryLine });
+    window = await readRolloutHistoryWindow(filePath, { before: cursor, size: stat.size, files: stat.historyFiles, maxBytes, mapLine: mapRolloutHistoryLine });
     entries = window.entries.concat(entries);
     const state = createRolloutParseState(stat, nowMs);
     if (before != null) state.preferredChatSource = messageCache.get(filePath)?.result?.chatSource;
@@ -2952,13 +2965,27 @@ async function parseRolloutTail(filePath, stat, limit, nowMs, before = null) {
   return {
     ...result,
     historyStart: window.startOffset,
-    historyFileId: `${stat.dev}:${stat.ino}`
+    historyFileId: stat.historyFileId || `${stat.dev}:${stat.ino}`
+  };
+}
+
+async function rolloutHistoryStat(filePath) {
+  const files = await rolloutHistoryFiles(filePath);
+  const latest = files[files.length - 1];
+  return {
+    ...latest,
+    size: latest.start + latest.size,
+    mtimeMs: Math.max(...files.map((file) => file.mtimeMs)),
+    historyFiles: files,
+    // Changes to earlier segments shift offsets and must reset browser history.
+    historyFileId: JSON.stringify(files.map((file, index) => [file.filePath, file.dev, file.ino,
+      ...(index < files.length - 1 ? [file.size, file.mtimeMs] : [])]))
   };
 }
 
 async function parseRollout(filePath, { limit = DEFAULT_MESSAGE_LIMIT, preferTail = false } = {}) {
-  const stat = await fs.stat(filePath);
-  const signature = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${preferTail ? normalizeMessageLimit(limit) : "full"}`;
+  const stat = preferTail ? await rolloutHistoryStat(filePath) : await fs.stat(filePath);
+  const signature = `${stat.historyFileId || `${stat.dev}:${stat.ino}`}:${stat.size}:${stat.mtimeMs}:${preferTail ? normalizeMessageLimit(limit) : "full"}`;
   const cached = messageCache.get(filePath);
   const nowMs = Date.now();
   const cachedAgeMs = nowMs - (cached?.cachedAtMs || 0);
@@ -3024,7 +3051,8 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
   const rolloutPath = resolveRolloutPath(thread.rolloutPath);
   if (!rolloutPath || !existsSync(rolloutPath)) {
     const messages = dedupeInteractionMessages(liveMessages.filter((message) => message.inputRequest?.mode !== "async"
-      || pendingDesktopInputs.has(message.inputRequest.sourceId))).sort(messageSortCompare);
+      || pendingDesktopInputs.has(message.inputRequest.sourceId)).map((message) => message.inputRequest?.mode === "async"
+        ? { ...message, inputReplyMode: desktopAsyncInputReplyMode(desktopInputState) } : message)).sort(messageSortCompare);
     const limited = limitMessagesForClient(messages, { thinking: false, interactionRequired: messages.some((message) => message.requiresDesktopAction) }, limit);
     return {
       thread,
@@ -3043,7 +3071,7 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
     };
   }
   if (before != null) {
-    const stat = await fs.stat(rolloutPath);
+    const stat = await rolloutHistoryStat(rolloutPath);
     const parsed = await parseRolloutTail(rolloutPath, stat, limit, Date.now(), before);
     // Historical approvals are not actionable; only the current poll supplies them.
     const messages = parsed.messages.filter((message) => message.role !== "interaction");
@@ -3059,12 +3087,13 @@ async function getMessages(id, { limit = DEFAULT_MESSAGE_LIMIT, before = null } 
     ...parsed.status,
     interactionRequired: parsed.status?.interactionRequired || ipcInteractions.some((message) => message.requiresDesktopAction)
   };
-  // IPC snapshots contain completed turns too. Async calls are actionable only
-  // when the current rollout also identifies them as pending, never on replay alone.
-  const pendingRolloutInputs = new Set(parsed.messages.filter((message) => message.inputRequest?.mode === "async").map((message) => message.inputRequest.sourceId));
+  // IPC history is actionable only when the latest rollout also identifies the
+  // question as unanswered. Normal output completion keeps that question pending.
+  const pendingRolloutInputs = new Map(parsed.messages.filter((message) => message.inputRequest?.mode === "async").map((message) => [message.inputRequest.sourceId, message]));
   const currentLiveMessages = liveMessages.filter((message) => !message.inputRequest
     || (message.inputRequest.mode === "async" ? pendingRolloutInputs.has(message.inputRequest.sourceId)
-      : !parsed.status.turnId || !message.turnId || message.turnId === parsed.status.turnId));
+      : !parsed.status.turnId || !message.turnId || message.turnId === parsed.status.turnId)).map((message) => message.inputRequest?.mode === "async"
+        ? { ...message, inputReplyMode: pendingRolloutInputs.get(message.inputRequest.sourceId).inputReplyMode } : message);
   const messages = dedupeInteractionMessages([...parsed.messages, ...currentLiveMessages].filter(pendingInput)).sort(messageSortCompare);
   status.interactionRequired = messages.some((message) => message.requiresDesktopAction);
   const limited = limitMessagesForClient(messages, status, limit, parsed.historyStart);
@@ -3517,14 +3546,14 @@ async function startNewCodexThreadViaAppServer(text, project = null, home = code
   };
   let threadId = "";
   let client;
+  let firstMessagePersisted = false;
   try {
     await assertHome();
     client = await getLocalAppServerClient(home);
     const created = await client.createThread({
       cwd: project?.rootPaths[0] || process.cwd(),
       workspaceRoots: project?.rootPaths || [process.cwd()],
-      projectId: project && !project.id.startsWith("root:") ? project.id : undefined,
-      title: text.split(/\r?\n/).find((line) => line.trim())?.trim().slice(0, 100) || "New conversation"
+      projectId: project && !project.id.startsWith("root:") ? project.id : undefined
     });
     threadId = created.threadId;
     appServerClients.set(threadId, client);
@@ -3532,15 +3561,16 @@ async function startNewCodexThreadViaAppServer(text, project = null, home = code
     void client.exited.then(() => {
       if (appServerClients.get(threadId) !== registered) return;
       appServerClients.delete(threadId);
-      notifyDesktopThreadAvailable(threadId, home);
+      if (firstMessagePersisted) notifyDesktopThreadAvailable(threadId, home);
     });
     appServerThreadIds.add(threadId);
     threadsCache = null;
-    notifyDesktopThreadAvailable(threadId, home);
     const createdAt = Date.now();
     await assertHome();
-    const response = await client.startTurn(threadId, desktopUserInput(text), settings);
-    logInfo(`[new-thread] app-server create=${createdAt - startedAt}ms submit=${Date.now() - createdAt}ms total=${Date.now() - startedAt}ms`);
+    const response = await client.startFirstTurn(threadId, desktopUserInput(text), settings);
+    firstMessagePersisted = response.firstMessagePersisted === true;
+    if (firstMessagePersisted) notifyDesktopThreadAvailable(threadId, home);
+    logInfo(`[new-thread] app-server create=${createdAt - startedAt}ms submit=${Date.now() - createdAt}ms total=${Date.now() - startedAt}ms previewReady=${firstMessagePersisted}`);
     return { threadId, turnId: response.turn?.id || null, source: "app-server" };
   } catch (error) {
     if (client && (error.status !== 504 || !threadId)) await client.close();
@@ -3868,8 +3898,10 @@ async function respondToUserInput({ threadId, requestId, answers } = {}) {
         hostId: "local", conversationId: threadId, requestId, response
       });
     } else {
-      const input = desktopUserInput(userInputReplyText(request, validated));
-      if (localClient?.active.has(threadId)) await localClient.steerTurn(threadId, input);
+      const replyText = userInputReplyText(request, validated);
+      const input = desktopUserInput(replyText);
+      if (message.inputReplyMode === "follow-up") await sendToCodex(replyText, threadId);
+      else if (localClient?.active.has(threadId)) await localClient.steerTurn(threadId, input);
       else await getCodexIpcClient().request("thread-follower-steer-turn", desktopSteerTurnParams(
         threadId, input, randomUUID(), { text: userInputReplyText(request, validated), cwd: data.thread?.cwd }
       ));

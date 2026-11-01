@@ -14,7 +14,10 @@ test("authenticated API hides indexed/spawned children and returns live and arch
   const root = fileURLToPath(new URL("../", import.meta.url));
   const ids = Array.from({ length: 5 }, (_, i) => `00000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`);
   const now = new Date().toISOString();
-  const source = (nickname) => ({ subagent: { thread_spawn: { parent_thread_id: ids[0], agent_nickname: nickname } } });
+  const source = (nickname) => ({ subagent: { thread_spawn: {
+    parent_thread_id: ids[0], agent_nickname: nickname,
+    ...(nickname !== "Worker 2" ? { agent_path: `/root/task_${nickname.slice(-1)}` } : {})
+  } } });
   const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
   await fs.mkdir(path.join(home, "sessions"));
   for (const [i, id] of ids.entries()) {
@@ -75,6 +78,7 @@ test("authenticated API hides indexed/spawned children and returns live and arch
   const parent = await get(`/api/threads/${ids[0]}/messages`);
   assert.equal(parent.thread.title, "Untitled");
   assert.equal(parent.thread.subagents.length, 3);
+  assert.deepEqual(parent.thread.subagents.map((row) => row.title).sort(), ["Task 1", "Task 3", "Worker 2"]);
   assert.equal(parent.thread.subagents.filter((row) => row.status.running).length, 1);
   assert.equal(parent.thread.subagents.filter((row) => row.status.completed).length, 2);
   const archived = await get(`/api/threads/${ids[2]}/messages`);
@@ -83,5 +87,5 @@ test("authenticated API hides indexed/spawned children and returns live and arch
   assert.ok(archived.messages.some((message) => message.content === "Fixture response 2"));
   const indexed = await get(`/api/threads/${ids[3]}/messages`);
   assert.equal(indexed.thread.parentId, ids[0]);
-  assert.equal(indexed.thread.title, "Worker 3");
+  assert.equal(indexed.thread.title, "Task 3");
 });

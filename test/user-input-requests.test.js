@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import vm from "node:vm";
-import { userInputRequest, validateUserInputAnswers, userInputReplyText, answeredUserInputIds, userInputResolved, desktopUserInputState, desktopPendingAsyncInputIds } from "../lib/user-input-requests.js";
+import { userInputRequest, validateUserInputAnswers, userInputReplyText, answeredUserInputIds, userInputResolved, desktopUserInputState, desktopPendingAsyncInputIds, desktopAsyncInputReplyMode } from "../lib/user-input-requests.js";
 import { desktopSteerTurnParams } from "../lib/desktop-ipc-protocol.js";
 import { desktopUserInput } from "../lib/desktop-user-input.js";
 import { appendQuotedOption } from "../public/user-input-dialog.js";
@@ -47,7 +47,7 @@ test("async replies use the Desktop envelope and only accepted replies resolve q
 });
 
 const source = await readFile(new URL("../server.js", import.meta.url), "utf8");
-function apiFixture({ allowWrite = true, mode = "async", homeChange = false, reject = false, local = false } = {}) {
+function apiFixture({ allowWrite = true, mode = "async", homeChange = false, reject = false, local = false, replyMode = "steer" } = {}) {
   const calls = [];
   let home = "/fixture/home";
   const inputRequest = mode === "async" ? request : userInputRequest({ id: "native", method: "item/tool/requestUserInput", params: { questions: [{ id: "scope", question: "Pick scope" }] } });
@@ -57,7 +57,7 @@ function apiFixture({ allowWrite = true, mode = "async", homeChange = false, rej
     ALLOW_WRITE: allowWrite, codexPaths: () => ({ home }), refreshCodexHomeContext: async () => {},
     getMessages: async (threadId) => {
       if (homeChange) home = "/another/home";
-      return { messages: threadId === "thread" && !submissions.has('submitted') ? [{ requestId: "pending", inputRequest, canRespond: true, requiresDesktopAction: true, source: local ? "app-server" : "desktop-ipc" }] : [] };
+      return { messages: threadId === "thread" && !submissions.has('submitted') ? [{ requestId: "pending", inputRequest, inputReplyMode: replyMode, canRespond: true, requiresDesktopAction: true, source: local ? "app-server" : "desktop-ipc" }] : [] };
     },
     validateUserInputAnswers, userInputReplyText, desktopUserInput, desktopSteerTurnParams, randomUUID: () => "client-message",
     appServerClients: new Map(local ? [["thread", {
@@ -65,6 +65,7 @@ function apiFixture({ allowWrite = true, mode = "async", homeChange = false, rej
       steerTurn: async (...args) => calls.push(["steer", ...args]),
       respondToUserInput: (...args) => calls.push(["respond", ...args])
     }]] : []),
+    sendToCodex: async (...args) => { calls.push(["send", ...args]); if (reject) throw new Error("send failed"); },
     getCodexIpcClient: () => ({ request: async (...args) => { calls.push(args); if (reject) throw new Error("unsupported"); } })
   };
   const respond = vm.runInNewContext(`const userInputSubmissions = new Set(); const userInputInFlight = new Set();\n${source.slice(source.indexOf("async function respondToUserInput("), source.indexOf("\nasync function serveStatic("))}\nrespondToUserInput`, context);
@@ -156,4 +157,47 @@ test("canonical Desktop history excludes older questions and incomplete patch se
   const unsafe = [{ params: { change: { type: "snapshot", revision: 1, conversationState: {} } } }, { params: { change: { type: "patches", baseRevision: 1, revision: 2, patches: [{ op: "add", path: ["__proto__", "polluted"], value: true }] } } }];
   assert.equal(desktopUserInputState(unsafe), null);
   assert.equal({}.polluted, undefined);
+});
+
+test("the latest unanswered async question survives output completion but expires on cancellation or a newer turn", () => {
+  const question = { type: "agentMessage", id: payload.call_id, completed: true, questions: [{ title: "Choose", options: ["Optional"] }] };
+  const nativeRequest = userInputRequest(question);
+  const snapshot = { turns: [{ turnId: "latest", status: "completed", items: [question] }], requests: [] };
+  assert.equal(desktopAsyncInputReplyMode(snapshot), "follow-up");
+  assert.equal(desktopPendingAsyncInputIds(snapshot).has(payload.call_id), true);
+  assert.equal(userInputResolved(nativeRequest, payload.call_id, [{ conversationState: snapshot }]), false);
+  for (const status of ["interrupted", "failed"]) {
+    snapshot.turns[0].status = status;
+    assert.equal(desktopPendingAsyncInputIds(snapshot).size, 0);
+    assert.equal(userInputResolved(nativeRequest, payload.call_id, [], snapshot), true);
+  }
+  snapshot.turns[0].status = "completed";
+  snapshot.turns.push({ turnId: "newer", status: "inProgress", items: [] });
+  assert.equal(userInputResolved(nativeRequest, payload.call_id, [], snapshot), true);
+  snapshot.turns.pop();
+  const reply = userInputReplyText(nativeRequest, { [nativeRequest.questions[0].id]: "Optional" });
+  snapshot.turns[0].items.push({ type: "userMessage", content: [{ type: "text", text: reply }] });
+  assert.equal(userInputResolved(nativeRequest, payload.call_id, [], snapshot), true);
+  assert.equal(desktopPendingAsyncInputIds(snapshot).size, 0);
+});
+
+test("answering after normal completion starts a follow-up instead of steering a finished turn", async () => {
+  for (const local of [false, true]) {
+    const { respond, calls, inputRequest } = apiFixture({ local, replyMode: "follow-up" });
+    const values = Object.fromEntries(inputRequest.questions.map((question) => [question.id, "Answer after completion"]));
+    await respond({ threadId: "thread", requestId: "pending", answers: values });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0][0], "send");
+    assert.equal(calls[0][2], "thread");
+    assert.deepEqual(answeredUserInputIds(calls[0][1]), inputRequest.questions.map((question) => question.id));
+  }
+  for (const variant of [{ allowWrite: false }, { homeChange: true }, { requestId: "expired" }, { answers: {} }]) {
+    const { respond, calls } = apiFixture({ ...variant, replyMode: "follow-up" });
+    await assert.rejects(respond({ threadId: "thread", requestId: "pending", answers, ...variant }));
+    assert.equal(calls.length, 0);
+  }
+  const { respond, calls } = apiFixture({ reject: true, replyMode: "follow-up" });
+  await assert.rejects(respond({ threadId: "thread", requestId: "pending", answers }), /send failed/);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], "send");
 });

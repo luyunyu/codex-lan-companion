@@ -165,3 +165,14 @@ test("Later remains temporary and a Close preference does not hide a reused bloc
   ui.controller.sync("thread", [{ ...blocking, turnId: "turn-two" }], true);
   assert.equal(ui.dialog.open, true);
 });
+
+test("normal output completion keeps an open unanswered dialog and its draft", () => {
+  const ui = fixture();
+  ui.controller.sync("thread", [{ ...message, inputReplyMode: "steer" }], true);
+  ui.type(0, "Still deciding when the final answer arrives");
+  const renders = ui.dialog.renders;
+  ui.controller.sync("thread", [{ ...message, inputReplyMode: "follow-up" }], true);
+  assert.equal(ui.dialog.open, true);
+  assert.equal(ui.dialog.renders, renders);
+  assert.equal(ui.fields[0].textarea.value, "Still deciding when the final answer arrives");
+});
